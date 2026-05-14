@@ -1,0 +1,7 @@
+# pretrain_RGCN
+rgcn_dim: 256
+num_rels: 8      # 关系总数
+num_layers: 4     # 层数
+num_bases: NULL   # RGCN基分解数量
+gamma: 12         # rotatE的gamma参数，用来区分正负样本
+num_nodes: 45667

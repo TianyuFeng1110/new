@@ -1,0 +1,4 @@
+hidden_dim: 256
+esm_dim: 320
+warmup_epochs: 10
+rgcn_dim: 256

@@ -1,0 +1,4 @@
+# verificaiton_gate and verificaiton_mlp
+warmup_epochs: 10
+esm_dim: 320 # esm2_t6_8M_UR50D的嵌入维度是320
+hidden_dim: 2048
