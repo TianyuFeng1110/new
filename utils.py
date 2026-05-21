@@ -20,6 +20,7 @@ from statistics import mean
 from scipy.special import expit
 from collections import defaultdict, deque
 from sklearn.metrics import precision_recall_curve, average_precision_score
+from safetensors.torch import save_file, load_file
 
 def lr_scheduler(current_epoch, warmup_epochs, max_epochs):
     """
@@ -733,9 +734,21 @@ def get_labels_index(node_list_path, term_list_path):
     with open(term_list_path, 'r', encoding='utf-8') as f:
         term_list = [line.rstrip('\n') for line in f] 
     with open(node_list_path, 'r', encoding='utf-8') as f:
-        node_list = [line.rstrip('\n').split(',')[1] for line in f] 
+        node_list = [line.rstrip('\n').split(',')[1] for line in f][1:] 
 
     index_map = {value: idx for idx, value in enumerate(node_list)}
     return [index_map[item] for item in term_list]
+
+def load_dict_from_safetensors(file_path):
+    return load_file(file_path)
+
+def get_mean_weights(w):
+    """计算权重矩阵w的每列的平均值，返回一个一维张量，表示三个概率的权重平均值"""
+    w = w.mean(dim=0).tolist()
+    return ', '.join([f"{x:.4f}" for x in w])
+
+
+
+
 
 

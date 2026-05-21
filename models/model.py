@@ -70,8 +70,7 @@ class CrossAttentionModule(nn.Module):
         )
 
         # 残差连接与层归一化
-        # output = self.layer_norm(attn_output) + go_features
-        output = self.layer_norm(attn_output) * go_features
+        output = self.layer_norm(attn_output) + go_features
 
         # 得到最终 Logits
         logits = self.classifier(output).squeeze(-1)
@@ -82,6 +81,14 @@ class CrossAttentionModule(nn.Module):
 class MaxFeatureModule(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_classes, dropout=0.4, eps=1e-5):
         super(MaxFeatureModule, self).__init__()
+
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.LayerNorm(input_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, input_dim)
+        )
 
         self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(input_dim, hidden_dim, kernel_size=5, padding=2)
@@ -106,8 +113,9 @@ class MaxFeatureModule(nn.Module):
 
     def forward(self, residue_feats, mask, labels):
 
+        x = self.mlp(residue_feats)
         # 输入维度转换: (batch, seq_len, input_dim) -> (batch, input_dim, seq_len)
-        x = residue_feats.transpose(1, 2)
+        x = x.transpose(1, 2)
         
         # 三路卷积并行处理
         x1 = F.gelu(self.conv1(x))
@@ -227,65 +235,28 @@ class Model(nn.Module):
             eps=eps 
         )
 
-    # NOTE 11J/11D/11G
     def forward(self, protein_feats_data, residue_feats_data, mask, labels):
 
+        protein_features = self.LayerNorm(protein_feats_data)
+        prototype_feats = self.LayerNorm(self.prototype_feats)
         residue_feats_data = self.residue_LayerNorm(residue_feats_data)
         go_LayerNorm = self.go_LayerNorm(self.go_features)
+        
+        mean_logits, mean_probs, mean_loss = self.meanFeature_module(protein_features, labels)
+        max_logits, max_probs, max_loss = self.maxFeature_module(residue_feats_data, mask, labels)
         cross_attn_logits, cross_attn_probs, cross_attn_loss = self.cross_attention_module(go_LayerNorm, residue_feats_data, mask, labels)
-        return cross_attn_logits, cross_attn_probs, cross_attn_loss
+        proto_probs, proto_loss, tau = self.prototype_Module(protein_features, prototype_feats, labels)
 
-    # # NOTE 10D和10J
-    # def forward(self, protein_feats_data, residue_feats_data, mask, labels):
+        weights = torch.softmax(self.term_gate_weight(self.go_features), dim=-1)
+        probs = weights[:, 0] * mean_probs + weights[:, 1] * max_probs + weights[:, 2] * cross_attn_probs
 
-    #     residue_feats_data = self.residue_LayerNorm(residue_feats_data)
-    #     max_logits, max_probs, max_loss = self.maxFeature_module(residue_feats_data, mask, labels)
-    #     return max_logits, max_probs, max_loss
+        # 联合概率
+        gate_c = torch.sigmoid(self.gate_c_raw) # 范围在0-1之间
+        sigma = 1.0 / (1.0 + torch.exp(-self.gate_k * (self.frequencies - gate_c)))
+        final_probs = sigma * probs + (1.0 - sigma) * proto_probs
 
-    # NOTE 14G
-    # def forward(self, protein_feats_data, residue_feats_data, mask, labels):
-
-    #     protein_features = self.LayerNorm(protein_feats_data)
-    #     prototype_feats = self.LayerNorm(self.prototype_feats)
-    #     residue_feats_data = self.residue_LayerNorm(residue_feats_data)
-    #     go_LayerNorm = self.go_LayerNorm(self.go_features)
+        # 通过概率倒推逻辑上的logits
+        final_logits = torch.logit(final_probs, eps=self.eps)
+        gate_loss = self.loss_fn(final_logits, labels)
         
-    #     cross_attn_logits, cross_attn_probs, cross_attn_loss = self.cross_attention_module(go_LayerNorm, residue_feats_data, mask, labels)
-    #     proto_probs, proto_loss, tau = self.prototype_Module(protein_features, prototype_feats, labels)
-
-    #     # 联合概率
-    #     gate_c = torch.sigmoid(self.gate_c_raw) # 范围在0-1之间
-    #     sigma = 1.0 / (1.0 + torch.exp(-self.gate_k * (self.frequencies - gate_c)))
-    #     final_probs = sigma * cross_attn_probs + (1.0 - sigma) * proto_probs
-
-    #     # 通过概率倒推逻辑上的logits
-    #     final_logits = torch.logit(final_probs, eps=self.eps)
-    #     gate_loss = self.loss_fn(final_logits, labels)
-        
-    #     return cross_attn_probs, proto_probs, final_probs, cross_attn_loss, proto_loss, gate_loss, tau, self.prototype_Module.b, self.gate_k, gate_c, sigma.mean()
-    
-    # def forward(self, protein_feats_data, residue_feats_data, mask, labels):
-
-    #     protein_features = self.LayerNorm(protein_feats_data)
-    #     prototype_feats = self.LayerNorm(self.prototype_feats)
-    #     residue_feats_data = self.residue_LayerNorm(residue_feats_data)
-    #     go_LayerNorm = self.go_LayerNorm(self.go_features)
-        
-    #     mean_logits, mean_probs, mean_loss = self.meanFeature_module(protein_features, labels)
-    #     max_logits, max_probs, max_loss = self.maxFeature_module(residue_feats_data, mask, labels)
-    #     cross_attn_logits, cross_attn_probs, cross_attn_loss = self.cross_attention_module(go_LayerNorm, residue_feats_data, mask, labels)
-    #     proto_probs, proto_loss, tau = self.prototype_Module(protein_features, prototype_feats, labels)
-
-    #     weights = torch.softmax(self.term_gate_weight(self.go_features), dim=-1)
-    #     probs = weights[:, 0] * mean_probs + weights[:, 1] * max_probs + weights[:, 2] * cross_attn_probs
-
-    #     # 联合概率
-    #     gate_c = torch.sigmoid(self.gate_c_raw) # 范围在0-1之间
-    #     sigma = 1.0 / (1.0 + torch.exp(-self.gate_k * (self.frequencies - gate_c)))
-    #     final_probs = sigma * probs + (1.0 - sigma) * proto_probs
-
-    #     # 通过概率倒推逻辑上的logits
-    #     final_logits = torch.logit(final_probs, eps=self.eps)
-    #     gate_loss = self.loss_fn(final_logits, labels)
-        
-    #     return mean_probs, max_probs, cross_attn_probs, proto_probs, final_probs, mean_loss, max_loss, cross_attn_loss, proto_loss, gate_loss, tau, self.prototype_Module.b, self.gate_k, gate_c, weights, sigma.mean()
+        return mean_probs, max_probs, cross_attn_probs, proto_probs, final_probs, mean_loss, max_loss, cross_attn_loss, proto_loss, gate_loss, tau, self.prototype_Module.b, self.gate_k, gate_c, weights, sigma.mean()

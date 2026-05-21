@@ -6,7 +6,7 @@ import torch.optim as optim
 import numpy as np
 
 from ruamel.yaml import YAML
-from new.models.cc_model import Model
+from new.models.model import Model
 from torch.optim.lr_scheduler import LambdaLR
 from functools import partial
 from new.datasets.dataset import Dataset
@@ -21,57 +21,54 @@ def valid(model, loader, epoch, device, batch_size):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('total_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('mean_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('max_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('attn_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('proto_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('gate_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('tau', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_std', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('mean_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('max_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('attn_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('proto_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('gate_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_std', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     header = 'Valid Epoch: [{}]'.format(epoch)
 
     all_probs, all_probs_mean, all_probs_max, all_probs_attn, all_probs_proto, all_labels = [],[],[],[],[],[]
     alpha_mean ,alpha_max, alpha_attn, alpha_proto, alpha_gate, scale = 0.1, 0.1, 0.2, 1, 0.7, (1 / batch_size) # 比例系数
     for batch_idx, (batch_protein_feats, batch_residue_feats, mask, labels) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
 
-        cross_attn_logits, cross_attn_probs, cross_attn_loss = model(batch_protein_feats.to(device), batch_residue_feats.to(device), mask.to(device), labels.to(device))
-        loss = (alpha_attn * cross_attn_loss) * scale
+        mean_probs, max_probs, cross_attn_probs, proto_probs, final_probs, mean_loss, max_loss, cross_attn_loss, proto_loss, gate_loss, tau, bias, k, c, weights, sigma = model(batch_protein_feats.to(device), batch_residue_feats.to(device), mask.to(device), labels.to(device))
+        loss = (alpha_mean * mean_loss + alpha_max * max_loss + alpha_attn * cross_attn_loss + alpha_proto * proto_loss + alpha_gate * gate_loss) * scale
 
-        # mean_probs, max_probs, cross_attn_probs, proto_probs, final_probs, mean_loss, max_loss, cross_attn_loss, proto_loss, gate_loss, tau, bias, k, c, weights, sigma = model(batch_protein_feats.to(device), batch_residue_feats.to(device), mask.to(device), labels.to(device))
-        # loss = (alpha_mean * mean_loss + alpha_max * max_loss + alpha_attn * cross_attn_loss + alpha_proto * proto_loss + alpha_gate * gate_loss) * scale
-
-        # all_probs.append(final_probs.detach().cpu())
-        # all_probs_mean.append(mean_probs.detach().cpu())
-        # all_probs_max.append(max_probs.detach().cpu())
+        all_probs.append(final_probs.detach().cpu())
+        all_probs_mean.append(mean_probs.detach().cpu())
+        all_probs_max.append(max_probs.detach().cpu())
         all_probs_attn.append(cross_attn_probs.detach().cpu())
-        # all_probs_proto.append(proto_probs.detach().cpu())
+        all_probs_proto.append(proto_probs.detach().cpu())
         all_labels.append(labels.detach().cpu())
 
         metric_logger.update(total_loss=loss.item())
-        # metric_logger.update(mean_loss=mean_loss.item() * alpha_mean * scale)
-        # metric_logger.update(max_loss=max_loss.item() * alpha_max * scale)
-        # metric_logger.update(attn_loss=cross_attn_loss.item() * alpha_attn * scale)
-        # metric_logger.update(proto_loss=proto_loss.item() * alpha_proto * scale)
-        # metric_logger.update(gate_loss=gate_loss.item() * alpha_gate * scale)
-        # metric_logger.update(tau=tau.item())
-        # metric_logger.update(bias_mean=bias.mean().item())
-        # metric_logger.update(bias_std=bias.std().item())
-        # metric_logger.update(bias_max=bias.max().item())
-        # metric_logger.update(bias_min=bias.min().item())
-        # metric_logger.update(k=k.item())
-        # metric_logger.update(c=c.item())
-        # metric_logger.update(sigma=sigma.item())
+        metric_logger.update(mean_loss=mean_loss.item() * alpha_mean * scale)
+        metric_logger.update(max_loss=max_loss.item() * alpha_max * scale)
+        metric_logger.update(attn_loss=cross_attn_loss.item() * alpha_attn * scale)
+        metric_logger.update(proto_loss=proto_loss.item() * alpha_proto * scale)
+        metric_logger.update(gate_loss=gate_loss.item() * alpha_gate * scale)
+        metric_logger.update(tau=tau.item())
+        metric_logger.update(bias_mean=bias.mean().item())
+        metric_logger.update(bias_std=bias.std().item())
+        metric_logger.update(bias_max=bias.max().item())
+        metric_logger.update(bias_min=bias.min().item())
+        metric_logger.update(k=k.item())
+        metric_logger.update(c=c.item())
+        metric_logger.update(sigma=sigma.item())
 
-    metric = utils.calculate_metrics(torch.cat(all_labels, dim=0).numpy(), torch.cat(all_probs_attn, dim=0).numpy(), is_logits = False)
-    # w = utils.get_mean_weights(weights.detach().cpu()) # 权重顺序为平均、最大、注意力
+    metric = utils.calculate_metrics(torch.cat(all_labels, dim=0).numpy(), torch.cat(all_probs, dim=0).numpy(), is_logits = False)
+    w = utils.get_mean_weights(weights.detach().cpu()) # 权重顺序为平均、最大、注意力
     metric_logger.synchronize_between_processes()
-    print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}, macro AUPRC: {:.4f}, mean negative score: {:.4f}, weights: {}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC'], metric['macro_AUPRC'], metric['mean_neg_score'], 0))
+    print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}, macro AUPRC: {:.4f}, mean negative score: {:.4f}, weights: {}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC'], metric['macro_AUPRC'], metric['mean_neg_score'], w))
 
     return all_probs, all_probs_mean, all_probs_max, all_probs_attn, all_probs_proto, all_labels
 
@@ -81,48 +78,45 @@ def train(model, optimizer, loader, epoch, device, batch_size):
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.8f}'))
     metric_logger.add_meter('total_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('mean_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('max_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('attn_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('proto_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('gate_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('tau', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_std', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('bias_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    # metric_logger.add_meter('sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('mean_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('max_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('attn_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('proto_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('gate_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_std', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
 
     alpha_mean ,alpha_max, alpha_attn, alpha_proto, alpha_gate, scale = 0.1, 0.1, 0.2, 1, 0.7, (1 / batch_size) # 比例系数
     for batch_idx, (batch_protein_feats, batch_residue_feats, mask, labels) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
         optimizer.zero_grad()
 
-        cross_attn_logits, cross_attn_probs, cross_attn_loss = model(batch_protein_feats.to(device), batch_residue_feats.to(device), mask.to(device), labels.to(device))
-        loss = (alpha_attn * cross_attn_loss) * scale
-
-        # _, _, _, _, _ , mean_loss, max_loss, cross_attn_loss, proto_loss, gate_loss, tau, bias, k, c, weights, sigma = model(batch_protein_feats.to(device), batch_residue_feats.to(device), mask.to(device), labels.to(device))
-        # loss = (alpha_mean * mean_loss + alpha_max * max_loss + alpha_attn * cross_attn_loss + alpha_proto * proto_loss + alpha_gate * gate_loss) * scale
+        _, _, _, _, _ , mean_loss, max_loss, cross_attn_loss, proto_loss, gate_loss, tau, bias, k, c, weights, sigma = model(batch_protein_feats.to(device), batch_residue_feats.to(device), mask.to(device), labels.to(device))
+        loss = (alpha_mean * mean_loss + alpha_max * max_loss + alpha_attn * cross_attn_loss + alpha_proto * proto_loss + alpha_gate * gate_loss) * scale
         loss.backward()
         optimizer.step()
         
         metric_logger.update(lr=optimizer.param_groups[-1]["lr"])  
         metric_logger.update(total_loss=loss.item())
-        # metric_logger.update(mean_loss=mean_loss.item() * alpha_mean * scale)
-        # metric_logger.update(max_loss=max_loss.item() * alpha_max * scale)
-        # metric_logger.update(attn_loss=cross_attn_loss.item() * alpha_attn * scale)
-        # metric_logger.update(proto_loss=proto_loss.item() * alpha_proto * scale)
-        # metric_logger.update(gate_loss=gate_loss.item() * alpha_gate * scale)
-        # metric_logger.update(tau=tau.item())
-        # metric_logger.update(bias_mean=bias.mean().item())
-        # metric_logger.update(bias_std=bias.std().item())
-        # metric_logger.update(bias_max=bias.max().item())
-        # metric_logger.update(bias_min=bias.min().item())
-        # metric_logger.update(k=k.item())
-        # metric_logger.update(c=c.item())
-        # metric_logger.update(sigma=sigma.item())
+        metric_logger.update(mean_loss=mean_loss.item() * alpha_mean * scale)
+        metric_logger.update(max_loss=max_loss.item() * alpha_max * scale)
+        metric_logger.update(attn_loss=cross_attn_loss.item() * alpha_attn * scale)
+        metric_logger.update(proto_loss=proto_loss.item() * alpha_proto * scale)
+        metric_logger.update(gate_loss=gate_loss.item() * alpha_gate * scale)
+        metric_logger.update(tau=tau.item())
+        metric_logger.update(bias_mean=bias.mean().item())
+        metric_logger.update(bias_std=bias.std().item())
+        metric_logger.update(bias_max=bias.max().item())
+        metric_logger.update(bias_min=bias.min().item())
+        metric_logger.update(k=k.item())
+        metric_logger.update(c=c.item())
+        metric_logger.update(sigma=sigma.item())
         
     metric_logger.synchronize_between_processes()
     print("Averaged stats: {}".format(metric_logger.global_avg()))
@@ -214,11 +208,11 @@ if __name__ == "__main__" :
     parser.add_argument('--device', type=str, default='cuda', help='device id')
     parser.add_argument('--config', type=str, default='./new/config/cc.yml', help='config/.yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
-    parser.add_argument('--batch_size', type=int, default=16, help='batch size') # CC:32, BP:4, MF:16
+    parser.add_argument('--batch_size', type=int, default=32, help='batch size') # CC:32, BP:4, MF:16
     parser.add_argument('--epochs', type=int, default=100, help='epoch')
     parser.add_argument('--path', type=str, default="./new/data/", help='datasets path')
     parser.add_argument('--result_path', type=str, default="/archive/hot3/fty/result/", help='result save path')
-    parser.add_argument('--namespace', default='MF', type=str, help='[BP/CC/MF]')
+    parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
     # parser.add_argument('--distributed', action='store_true')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
