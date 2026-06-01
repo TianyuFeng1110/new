@@ -21,6 +21,8 @@ from scipy.special import expit
 from collections import defaultdict, deque
 from sklearn.metrics import precision_recall_curve, average_precision_score
 from safetensors.torch import save_file, load_file
+from goatools.obo_parser import GODag
+from goatools.semantic import TermCounts
 
 def lr_scheduler(current_epoch, warmup_epochs, max_epochs):
     """
@@ -120,6 +122,16 @@ def is_main_process():
         return True
 
     return dist.get_rank() == 0
+
+def get_rank():
+    if not dist.is_available() or not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+def get_world_size():
+    if not dist.is_available() or not dist.is_initialized():
+        return 1
+    return dist.get_world_size()
 
 def load_dict_from_pkl(file_path):
 
@@ -291,22 +303,68 @@ def is_dist_avail_and_initialized():
         return False
     return True
 
-def calculate_metrics(y_true, input, is_logits=True):
+def get_ic(obo_path, term_list_path, gene_label_path):
+    """
+    计算基因本体术语的信息值 (Information Content, IC)，使用 goatools 库的 TermCounts 实现。
+    IC 基于标注频率计算: IC(c) = -log( freq(c) / max_freq )，会自动沿 DAG 向上传播计数。
+
+    :param obo_path: GO OBO 文件路径 (如 data/go-basic.obo)
+    :param term_list_path: term_list 文件路径，每行一个 GO term
+    :param gene_label_path: 训练集基因标注文件，每行格式: protein_id\\tGO:term1,GO:term2,...
+    :return: numpy.ndarray, 形状 (n_terms,)，按 term_list 顺序排列的 IC 值
+    NOTE 目前计算IC的方法是基于训练集的标注频率进行计算的，理论上应当使用gaf文件去计算
+    """
+    # 1. 加载 GO DAG
+    godag = GODag(obo_path, optional_attrs=['relationship'])
+
+    # 2. 读取 term_list
+    with open(term_list_path, 'r') as f:
+        term_list = [line.strip() for line in f if line.strip()]
+
+    # 3. 构建 geneid -> set(GO IDs) 字典 (TermCounts 的 annots 参数要求 dict 格式)
+    gene2gos = defaultdict(set)
+    with open(gene_label_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            protein_id = parts[0]
+            go_terms = parts[1].split(',')
+            gene2gos[protein_id].update(go_terms)
+
+    # 4. 使用 TermCounts 沿 DAG 传播计数并计算 IC
+    tcntobj = TermCounts(godag, gene2gos)
+
+    # 5. 按 term_list 顺序计算 IC = -log(freq)，缺失项填 0.0
+    ic_values = []
+    for go_id in term_list:
+        freq = tcntobj.get_term_freq(go_id)
+        if freq > 0:
+            ic_values.append(-math.log(freq))
+        else:
+            ic_values.append(0.0)
+
+    return np.asarray(ic_values, dtype=np.float64)
+
+def calculate_metrics(y_true, input, is_logits=True, ic=None):
     """
     y_true: ndarray, shape (n_samples, n_classes), multi-hot 编码
-    logits: ndarray, shape (n_samples, n_classes), 模型原始输出
+    input:  ndarray, shape (n_samples, n_classes), 模型原始输出
+    ic:     ndarray, shape (n_classes,), 每个 GO term 的信息量 (Information Content).
+            如果为 None，则根据 y_true 的标注频率自动计算: IC(c) = -log(freq(c)/max_freq).
     """
     if is_logits:
         y_pred = expit(input)
     else:
         y_pred = input
 
+    n_samples, n_classes = y_true.shape
+
     # --- Fmax 计算 ---
-    # 计算所有可能的阈值下的 precision 和 recall
-    # 展平处理以计算全局阈值 (CAFA 标准做法)
     precision, recall, thresholds = precision_recall_curve(y_true.ravel(), y_pred.ravel())
-    
-    # 过滤掉分母为 0 的情况
     f1_scores = np.divide(2 * precision * recall, precision + recall, 
                           out=np.zeros_like(precision), where=(precision + recall) > 0)
     fmax = np.max(f1_scores)
@@ -314,7 +372,6 @@ def calculate_metrics(y_true, input, is_logits=True):
     # --- AUPRC 计算 ---
     micro_auprc = average_precision_score(y_true, y_pred, average='micro')
 
-    # macro AUPRC如果某个类别正样本数为0，则无法计算召回率(分母为0)，因此剔除正样本为0的类别。所以负样本的指标通过平均负样本得分来评判。
     mask = y_true.sum(axis=0) > 0
     y_true_mask = y_true[:, mask]
     y_pred_mask = y_pred[:, mask]
@@ -324,11 +381,42 @@ def calculate_metrics(y_true, input, is_logits=True):
     neg_scores = y_pred[y_true == 0]
     mean_neg_score = np.mean(neg_scores)
 
+    # ---- WFmax & Smin (CAFA 标准, 101 个均匀阈值) ----
+    n_t = 101
+    thresholds = np.linspace(0.0, 1.0, n_t)
+
+    ic_true = (y_true * ic).sum(axis=1)          # (n_samples,) 每蛋白真实标注总 IC
+    total_ic = ic_true.sum()
+    mask_true = ic_true > 0
+
+    wf = np.zeros(n_t)
+    ru = np.zeros(n_t)
+    mi = np.zeros(n_t)
+
+    for i, t in enumerate(thresholds):
+        y_bin = (y_pred >= t).astype(np.float64)
+        intersect = (y_bin * y_true * ic).sum(axis=1)
+        pred_ic = (y_bin * ic).sum(axis=1)
+        mask_pred = pred_ic > 0
+
+        wPr = np.mean(intersect[mask_pred] / pred_ic[mask_pred]) if mask_pred.any() else 0.0
+        wRc = np.mean(intersect[mask_true] / ic_true[mask_true]) if mask_true.any() else 0.0
+        wf[i] = 2 * wPr * wRc / (wPr + wRc) if wPr + wRc > 0 else 0.0
+
+        if total_ic > 0:
+            ru[i] = (y_true * (1 - y_bin) * ic).sum() / total_ic
+            mi[i] = ((1 - y_true) * y_bin * ic).sum() / total_ic
+
+    wfmax = float(wf.max())
+    smin = float(np.sqrt(ru ** 2 + mi ** 2).min())
+
     return {
         "Fmax": fmax,
         "micro_AUPRC": micro_auprc,
         "macro_AUPRC": macro_auprc,
-        "mean_neg_score": mean_neg_score
+        "mean_neg_score": mean_neg_score,
+        "WFmax": wfmax,
+        "Smin": smin
     }
 
 def process_prototype(prototype_dict, go2id):
@@ -742,9 +830,32 @@ def get_labels_index(node_list_path, term_list_path):
 def load_dict_from_safetensors(file_path):
     return load_file(file_path)
 
+# NOTE ：ds写的新的分片加载的方法
+def new_load_dict_from_safetensors(path):
+    """
+    从 safetensors 文件中加载蛋白质特征字典。
+    支持两种格式：
+    - 单个 .safetensors 文件 (向后兼容旧格式)
+    - 目录 (包含多个 part_XXXX.safetensors 分片文件)
+    """
+    if os.path.isdir(path):
+        # 从分片目录加载：逐个读取 part_*.safetensors 并合并
+        result = {}
+        import glob
+        part_files = sorted(glob.glob(os.path.join(path, 'part_*.safetensors')))
+        if not part_files:
+            raise FileNotFoundError(f'目录 {path} 中未找到 part_*.safetensors 分片文件')
+        print(f'正在从 {len(part_files)} 个分片文件中加载特征...')
+        for part_file in part_files:
+            result.update(load_file(part_file))
+        print(f'✅ 加载完成，共 {len(result)} 个蛋白质特征')
+        return result
+    else:
+        return load_file(path)
+
 def get_mean_weights(w):
     """计算权重矩阵w的每列的平均值，返回一个一维张量，表示三个概率的权重平均值"""
-    w = w.mean(dim=0).tolist()
+    w = w.mean(dim=(0, 1)).tolist()
     return ', '.join([f"{x:.4f}" for x in w])
 
 
