@@ -1084,13 +1084,10 @@ def build_ic_from_cafa3(cafa3_path, namespace, idx2go, go2id, obo_path):
 
     return ic
 
-def compute_go_term_frequency(go_to_proteins, total_proteins):
+def compute_go_term_frequency(mask, num_proteins):
     '''获取每个go term的频率'''
     
-    go_freq = [0.0] * len(go_to_proteins)
-    for go_idx, protein_list in enumerate(go_to_proteins):
-        go_freq[go_idx] = len(protein_list) / total_proteins
-    return go_freq
+    return mask.sum(dim=1).float() / num_proteins
 
 def compute_protein_alf(protein_labels, go_frequencies):
     '''获取蛋白质的ALF'''
@@ -1119,6 +1116,47 @@ def get_prototype_index(train_seq_cc):
             
     return go_to_proteins
 
+def get_prototype_index_tensor(train_seq_cc):
+    '''
+    返回:
+        padded_tensor: (num_go_terms, max_proteins) 的二维 LongTensor，
+                       每一行对应该 GO term 注释到的蛋白质索引，不足位置用 -1 填充
+        mask:          (num_go_terms, max_proteins) 的 BoolTensor，
+                       True 表示有效蛋白质索引，False 表示填充位
+    '''
+
+    # 获取GO term的最大索引（假定索引从0开始），以确定二维列表的行数
+    max_go_idx = max((label for item in train_seq_cc for label in item.get('label', [])), default=-1)
+    num_go_terms = max_go_idx + 1
+
+    # 初始化二维列表，每一行对应一个go term，存放注释到该go term的蛋白质索引
+    go_to_proteins = [[] for _ in range(num_go_terms)]
+
+    # 建立映射：将蛋白质索引（即train_seq_cc的元素位置）存入对应的go term列表中
+    for protein_idx, item in enumerate(train_seq_cc):
+        for label in item.get('label', []):
+            go_to_proteins[label].append(protein_idx)
+
+    # 计算最大蛋白质数，用于 padding
+    max_proteins = max((len(prots) for prots in go_to_proteins), default=0)
+
+    # 构建 padded tensor 和 mask
+    padded_list = []
+    mask_list = []
+    for prots in go_to_proteins:
+        n = len(prots)
+        # 有效索引 + -1 填充
+        row = prots + [-1] * (max_proteins - n)
+        padded_list.append(row)
+        # mask: 前 n 个为 True，其余为 False
+        mask_row = [True] * n + [False] * (max_proteins - n)
+        mask_list.append(mask_row)
+
+    padded_tensor = torch.tensor(padded_list, dtype=torch.long)
+    mask = torch.tensor(mask_list, dtype=torch.bool)
+
+    return padded_tensor, mask
+
 def compute_hier_loss(logits, parent_indices, child_indices):
     """R = 1/|E| * sum_{(i,j)∈E} max(0, y_j - y_i)，i父j子"""
     return torch.relu(logits[:, child_indices] - logits[:, parent_indices]).mean()
@@ -1127,6 +1165,7 @@ def get_hier_scale(model, train_loader, parent_indices, child_indices, device, n
     """多 batch 静态标定：遍历多个 batch 累积梯度模长，取总模长比作为缩放因子，
     避免单 batch（尤其 batch_size=4~16）带来的高方差。
     """
+    print('静态标定法获取梯度比例中...')
     model.train()  # 标定时需要 grad 可用
     params = [p for p in model.parameters() if p.requires_grad]
 
@@ -1134,12 +1173,12 @@ def get_hier_scale(model, train_loader, parent_indices, child_indices, device, n
     hier_norms_sq = 0.0
     actual_batches = 0
 
-    for batch_idx, (batch_residue_feats, mask, labels) in enumerate(train_loader):
+    for batch_idx, (batch_residue_feats, mask, labels, indices) in enumerate(train_loader):
         if batch_idx >= num_calib_batches:
             break
 
         # custom_logits, custom_loss = model(batch_residue_feats.to(device), mask.to(device), labels.to(device))
-        logits, custom_logits, custom_loss, proto_loss, gate_loss, sigma, freq = model(batch_residue_feats.to(device), mask.to(device), labels.to(device))
+        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma = model(batch_residue_feats.to(device), indices.to(device), mask.to(device), labels.to(device))
         hier_loss = compute_hier_loss(custom_logits, parent_indices, child_indices)
 
         grad_custom = torch.autograd.grad(custom_loss, params, retain_graph=True, allow_unused=True)
@@ -1168,4 +1207,62 @@ def get_hier_scale(model, train_loader, parent_indices, child_indices, device, n
           f"total_hier_grad_norm={hier_norms_sq ** 0.5:.4f}, "
           f"hier_scale={scale:.4f}")
     return scale
+
+
+def print_loss_gradients(model, train_loader, parent_indices, child_indices, device, num_batches=5):
+    """打印各 loss 对全部参数的梯度 L2 范数（不做任何标定建议，仅输出原始数据）。
+
+    输出每 batch 的梯度范数以及平均值，方便手动调整 scale。
+
+    注意：由于 forward 中 custom_probs/proto_probs 有 .detach()，
+    gate_loss 梯度只流向 gate_k、gate_c，其范数会远小于其他 loss。
+    """
+    print('=' * 60)
+    print('各 Loss 梯度 L2 范数（原始值，未加权）')
+    print('=' * 60)
+
+    model.train()
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    records = []
+    for batch_idx, (batch_residue_feats, mask, labels, indices) in enumerate(train_loader):
+        if batch_idx >= num_batches:
+            break
+
+        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma = model(
+            batch_residue_feats.to(device), indices.to(device), mask.to(device), labels.to(device)
+        )
+        hier_loss = compute_hier_loss(custom_logits, parent_indices, child_indices)
+
+        grad_custom = torch.autograd.grad(custom_loss, params, retain_graph=True, allow_unused=True)
+        grad_proto  = torch.autograd.grad(proto_loss,  params, retain_graph=True, allow_unused=True)
+        grad_gate   = torch.autograd.grad(gate_loss,   params, retain_graph=True, allow_unused=True)
+        grad_hier   = torch.autograd.grad(hier_loss,   params, retain_graph=False, allow_unused=True)
+
+        c_norm = sum(g.data.norm().item() ** 2 for g in grad_custom if g is not None) ** 0.5
+        p_norm = sum(g.data.norm().item() ** 2 for g in grad_proto  if g is not None) ** 0.5
+        g_norm = sum(g.data.norm().item() ** 2 for g in grad_gate   if g is not None) ** 0.5
+        h_norm = sum(g.data.norm().item() ** 2 for g in grad_hier   if g is not None) ** 0.5
+
+        records.append((c_norm, p_norm, g_norm, h_norm))
+        print(f'  batch {batch_idx:2d}: '
+              f'custom_grad={c_norm:.4f}  '
+              f'proto_grad={p_norm:.4f}  '
+              f'gate_grad={g_norm:.4f}  '
+              f'hier_grad={h_norm:.4f}')
+
+    model.zero_grad(set_to_none=True)
+
+    if records:
+        avg_c = sum(r[0] for r in records) / len(records)
+        avg_p = sum(r[1] for r in records) / len(records)
+        avg_g = sum(r[2] for r in records) / len(records)
+        avg_h = sum(r[3] for r in records) / len(records)
+        print('-' * 60)
+        print(f'  平均值:    '
+              f'custom_grad={avg_c:.4f}  '
+              f'proto_grad={avg_p:.4f}  '
+              f'gate_grad={avg_g:.4f}  '
+              f'hier_grad={avg_h:.4f}')
+    print('=' * 60)
 

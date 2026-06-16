@@ -7,13 +7,14 @@ class collator:
         self.residue_feats = residue_feats
 
     def __call__(self, data):
-        # data 中每个元素: (idx, mode, seq, label_indices, go_ids)
+        # data 中每个元素: (idx, seq, label_indices)
+        indices = torch.tensor([elem[0] for elem in data])
         batch_residue_feats, mask = self._process_residue_feats(
             [self.residue_feats[elem[0]] for elem in data]
         )
         labels = self._get_labels(data)
 
-        return batch_residue_feats, mask, labels
+        return batch_residue_feats, mask, labels, indices
 
     def _process_residue_feats(self, residue_feats):
         """将不同长度的残基特征统一为固定长度，padding 部分填充 0。
