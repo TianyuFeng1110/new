@@ -1,118 +1,66 @@
 import torch.nn as nn
 import torch
-import torch.nn.functional as F
 from timm.loss import AsymmetricLossMultiLabel
+import torch.nn.functional as F
 
-class LocalMotifFeatureExtractionModule(nn.Module):
-    def __init__(self, input_dim, hidden_dim, kernel_size, dilations=None, dropout=0.4):
-        """
-        Args:
-            dilations: 3层卷积各自的膨胀率，默认 [1, 1, 1]（等价于普通卷积）。
-                       膨胀卷积可在不增加参数量的前提下指数级扩大感受野。
-                       
-            第i层的卷积核为 (k-1) * dilations_i + 1。第i层感受野为i-1层的感受野加上当前层卷积核大小再减去1。
-        """
-        super(LocalMotifFeatureExtractionModule, self).__init__()
-        if dilations is None:
-            dilations = [1, 1, 1]
-        d1, d2, d3 = dilations
-
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        # padding 根据 dilation 自动计算以保持序列长度不变: pad = (k-1) * d / 2
-        self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size,
-                               padding=(kernel_size - 1) * d1 // 2, dilation=d1)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size,
-                               padding=(kernel_size - 1) * d2 // 2, dilation=d2)
-        self.conv3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size,
-                               padding=(kernel_size - 1) * d3 // 2, dilation=d3)
-        # GN代替LN，以避免频繁的维度顺序切换造成的开销
-        self.norm1 = nn.GroupNorm(1, hidden_dim)
-        self.norm2 = nn.GroupNorm(1, hidden_dim)
-        self.norm3 = nn.GroupNorm(1, hidden_dim)
-        
-        # 卷积层之间以及拼接后的 Dropout
-        self.inter_conv_dropout = nn.Dropout(dropout)
-        self.feature_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        
-        self.LayerNorm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, residue_feats, mask):
-
-        x = self.mlp(residue_feats)
-        x = x.transpose(1, 2)
-        mask_expanded = mask.unsqueeze(1)
-        
-        # 三层卷积堆叠处理, 卷积后乘以 mask 来屏蔽 padding 的影响
-        x_conv1 = self.conv1(x)
-        conv1_out = F.gelu(self.norm1(x_conv1)) * mask_expanded
-        conv1_out = self.inter_conv_dropout(conv1_out)
-
-        x_conv2 = self.conv2(conv1_out)
-        conv2_out = F.gelu(self.norm2(x_conv2)) * mask_expanded
-        conv2_out = self.inter_conv_dropout(conv2_out)
-        
-        x_conv3 = self.conv3(conv2_out)
-        conv3_out = F.gelu(self.norm3(x_conv3)) * mask_expanded
-
-        # 在 hidden_dim 维度直接拼接并降维
-        merged = torch.cat([x, conv1_out, conv2_out, conv3_out], dim=1).transpose(1, 2)
-        merged = self.feature_fusion(merged) * mask.unsqueeze(-1)
-        merged = self.LayerNorm(merged)
-        
-        return merged
-
-class Model(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_classes, kernel_size, go_freq, dilations=None, dropout=0.4):
-        super(Model, self).__init__()
-
-        self.num_classes = num_classes
-        self.residue_LayerNorm = nn.LayerNorm(input_dim)
-        self.go_freq = go_freq
-
-        self.local_feats_extraction_module = LocalMotifFeatureExtractionModule(input_dim, hidden_dim, kernel_size=kernel_size, dilations=dilations, dropout=dropout)
-
-        # 注意力分数
-        self.attn_score = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-
-        self.pre_classifier_dropout = nn.Dropout(dropout)
-
-        # 原型概率可学习的参数τ和bias
-        self.base_tau = 5.0 # tau的缩放因子
+class PrototypeModule(nn.Module):
+    def __init__(self, num_classes):
+        super(PrototypeModule, self).__init__()
+        self.base_tau = 1.0  # 缩小缩放因子，避免初始 proto_logits 过于极端
         self.log_tau = nn.Parameter(torch.tensor(0.0))
         self.b = nn.Parameter(torch.zeros(num_classes))
-        self.prototype_feats = nn.Parameter(torch.randn(num_classes, hidden_dim))
 
-        # 概率结合可学习的参数: 中心阈值c和平滑系数k
-        self.gate_k = nn.Parameter(torch.tensor([2.0])) 
-        go_freq_log = torch.log(self.go_freq + 1e-6) 
-        self.feq_log_mean = go_freq_log.mean()
-        self.feq_log_std = go_freq_log.std()
-        self.go_freq_norm = (go_freq_log - self.feq_log_mean) / (self.feq_log_std + 1e-8) # z-score标准化
-        self.gate_c = nn.Parameter(torch.tensor([0.0]))
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim), 
-            nn.LayerNorm(hidden_dim),
+    def forward(self, pooled_feats, prototype_feats):
+        protein_feats = F.normalize(pooled_feats, p=2, dim=1)
+        prototype_feats = F.normalize(prototype_feats, p=2, dim=1)
+        distances = torch.cdist(protein_feats, prototype_feats, p=2.0) ** 2 # 计算欧氏距离的平方, distances[i, j] 表示第 i 个蛋白质到第 j 个原型的距离
+        tau = -torch.exp(self.log_tau) * self.base_tau # tau 一定为负
+        proto_logits = tau * distances + self.b
+        # proto_loss = self.loss_fn(proto_logits, labels)
+        # proto_probs = torch.sigmoid(proto_logits)
+        return proto_logits
+
+class Model(nn.Module):
+    """简单的两层 MLP 基准模型：均值池化 + Linear-ReLU-Dropout-Linear"""
+
+    def __init__(self, input_dim, hidden_dim, num_classes, prototype_index, proto_idx_mask, go_freq, dropout=0.4, momentum_factor=0.99):
+        super(Model, self).__init__()
+
+        self.register_buffer('prototype_index', prototype_index)
+        self.register_buffer('proto_idx_mask', proto_idx_mask)
+        self.register_buffer('frequency', go_freq)
+        self.momentum_factor = momentum_factor
+
+        self.proj = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes), 
+            nn.Dropout(p=dropout),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
         )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+        # protein_feats 和 prototype_feats 在 init_protein_feats() / init_prototype_feats() 中惰性注册
+        self.proto_module = PrototypeModule(num_classes)
+
+        self.gate_k = nn.Parameter(torch.tensor([2.0])) 
+        self.gate_c = nn.Parameter(torch.tensor([0.0]))
+
+        # 用于初始化中心阈值
+        freq_log = torch.log(self.frequency + 1e-6)
+        freq_log_mean = freq_log.mean()
+        freq_log_std = freq_log.std()
+        freq_norm = (freq_log - freq_log_mean) / (freq_log_std + 1e-8)  # z-score标准化
+        self.register_buffer('freq_log_mean', freq_log_mean)
+        self.register_buffer('freq_log_std', freq_log_std)
+        self.register_buffer('freq_norm', freq_norm)
 
         self.loss_fn = AsymmetricLossMultiLabel(
             gamma_neg=4,
@@ -121,74 +69,149 @@ class Model(nn.Module):
             eps=1e-8 
         )
 
-    def forward(self, residue_feats_data, mask, labels):
+    def forward(self, input_feats, indices, labels):
 
-        residue_feats_data = self.residue_LayerNorm(residue_feats_data)
+        # 轻量级网络
+        feats = self.proj(input_feats)
 
-        # custom 模块
-        merged_feats = self.local_feats_extraction_module(residue_feats_data, mask)
-        mean_feats = self._get_mean_pooled_features(merged_feats, mask)
-        max_feats = self._get_max_pooled_features(merged_feats, mask)
-        attn_feats = self._get_attention_pooled_features(merged_feats, mask)
-
-        merged = torch.cat([mean_feats, max_feats, attn_feats], dim=-1) 
-        merged = self.pre_classifier_dropout(merged)
-        custom_logits = self.classifier(merged) # (B, num_classes)
+        custom_logits = self.classifier(feats)
         custom_loss = self.loss_fn(custom_logits, labels)
         custom_probs = torch.sigmoid(custom_logits)
 
-        # 原型部分
-        protein_feats = F.normalize(merged, p=2, dim=1)
-        prototype_feats = F.normalize(self.prototype_feats, p=2, dim=1)
-        distances = torch.cdist(protein_feats, prototype_feats, p=2.0) ** 2 # 计算欧氏距离的平方, distances[i, j] 表示第 i 个蛋白质到第 j 个原型的距离
-        tau = -torch.exp(self.log_tau) * self.base_tau # tau 一定为负
-        proto_logits = tau * distances + self.b
+        # 原型网络
+        proto_logits = self.proto_module(feats, self.prototype_feats)
         proto_loss = self.loss_fn(proto_logits, labels)
         proto_probs = torch.sigmoid(proto_logits)
+        # 更新原型
+        if self.training:
+            self.protein_feats[indices] = feats.detach() # 更新蛋白质矩阵（detach 断开计算图，避免图累积）
+            active_mask = (labels == 1).any(dim=0)
+            unique_indices = torch.nonzero(active_mask, as_tuple=True)[0] # 待更新的原型索引
+            self._update_prototype_feats(unique_indices)
 
-        # 理论上sigma初始为0.5
-        sigma = 1.0 / (1.0 + torch.exp(-self.gate_k * (self.go_freq_norm - self.gate_c)))
+        # 融合
+        sigma = 1.0 / (1.0 + torch.exp(-self.gate_k * (self.freq_norm - self.gate_c))) # TODO self.freq_norm用于数值稳定，平均值为0，73%的数值落在-2到2之内。但是这样就gate c就要初始化为0，但是目前的初始化方法会导致gate c可能为负，导致sigma上升(0.5 ＜ sigmod(k=2 * (freq_norm=0 - gate_c=负数) ))
         final_probs = sigma * custom_probs + (1.0 - sigma) * proto_probs
 
         # 通过概率倒推逻辑上的logits
         logits = torch.logit(final_probs, eps=1e-6)
         gate_loss = self.loss_fn(logits, labels)
         
-        # 计算日志输出的变量(当sigma为0.5时，对应的go term频率是多少)
-        target_log = self.gate_c.item() * (self.feq_log_std + 1e-8) + self.feq_log_mean # 逆 Z-Score 标准化
-        target_freq = torch.exp(target_log) - 1e-6 # 逆对数变换（解出原始频率）
-        target_freq = torch.clamp(target_freq, min=0.0)
+        return final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma
 
-        return logits, custom_logits, custom_loss, proto_loss, gate_loss, sigma.mean(), target_freq
-    
-    def _get_mean_pooled_features(self, merged, mask):
-        # 平均池化
-        mask_expanded = mask.unsqueeze(-1)
-        masked_feats = merged * mask_expanded
-        pooled = masked_feats.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+    @torch.no_grad()
+    def init_protein_feats(self, stacked_feats):
+        """
+        注册预池化的蛋白质特征矩阵。
+        应在模型 .to(device) 之后调用，充分利用 GPU 加速。
 
-        return pooled
-    
-    def _get_max_pooled_features(self, merged, mask):
-        # 处理 Mask：将 Padding 部分设为极小值以忽略其对 Max Pooling 的影响
-        mask_expanded = mask.unsqueeze(-1)
-        merged = merged.masked_fill(mask_expanded == 0, -1e9)
+        Args:
+            pooled_feats: list of Tensors, 每个 Tensor 形状为 (input_dim,)，已在 CPU 上
+            device: 目标设备（如 'cuda:0'）
+        """
+        self.eval()
+        protein_feats = self.proj(stacked_feats)  # (N, hidden_dim)
+        self.register_buffer('protein_feats', protein_feats)
+        self.train()
+
+    @torch.no_grad()
+    def init_prototype_feats(self, num_classes, hidden_dim):
+        """
+        用每个 GO term 对应蛋白质的平均特征初始化 prototype_feats，
+        避免纯随机初始化导致原型网络从一开始就失效。
+        需要在 init_protein_feats() 之后调用，且模型已在目标设备上。
+        """
+        self.eval()
+        prototype_feats = torch.randn(num_classes, hidden_dim, device=self.protein_feats.device)
+        for c in range(num_classes):
+            # 获取该 GO term 对应蛋白质的有效索引
+            mask = self.proto_idx_mask[c]       # (max_proteins,)
+            indices = self.prototype_index[c]   # (max_proteins,)
+            valid_indices = indices[mask]       # 有效蛋白质索引
+            
+            if valid_indices.size(0) > 0:
+                # 取这些蛋白质特征的平均值
+                proto_mean = self.protein_feats[valid_indices].mean(dim=0)
+                prototype_feats[c] = proto_mean
         
-        # 全局最大池化
-        pooled = torch.max(merged, dim=1)[0]
-        return pooled
+        self.register_buffer('prototype_feats', prototype_feats)
+        self.train()
 
-    def _get_attention_pooled_features(self, merged, mask):
+    def _update_prototype_feats(self, unique_indices):
+        # 向量化更新 prototype_feats：只 gather 有效条目，避免 (k, data_num, dim) 中间张量
+        k = unique_indices.size(0)
+        device = self.protein_feats.device
 
-        # 计算注意力得分
-        scores = self.attn_score(merged)  # (B, L, 1)
-        
-        # 将 padding 位置的得分设为 -inf，使 softmax 后权重为 0
-        scores = scores.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))
-        
-        # Softmax 归一化 + 加权求和
-        attn_weights = F.softmax(scores, dim=1)  # (B, L, 1)
-        pooled = (merged * attn_weights).sum(dim=1)  # (B, D)
-        
-        return pooled
+        selected_indices = self.prototype_index[unique_indices]   # (k, data_num)
+        selected_mask = self.proto_idx_mask[unique_indices]       # (k, data_num)
 
+        # 构建 prototype ID 矩阵：每行填满其 prototype 序号 0..k-1
+        proto_ids = torch.arange(k, device=device).unsqueeze(1).expand_as(selected_mask)
+
+        # 只保留有效条目，展平为 1D
+        flat_proto_ids = proto_ids[selected_mask]                  # (total_valid,)
+        flat_indices = selected_indices[selected_mask]             # (total_valid,)
+
+        # 一次性 gather 所有有效蛋白质的特征
+        valid_feats = self.protein_feats[flat_indices]             # (total_valid, dim)
+
+        # index_add 按 prototype 聚合并求和（纯 GPU 算子，无 Python 循环）
+        sum_feats = torch.zeros(k, valid_feats.size(1), device=device, dtype=valid_feats.dtype)
+        sum_feats.index_add_(0, flat_proto_ids, valid_feats)      # (k, dim)
+
+        # 每个 prototype 的有效蛋白质数量
+        valid_counts = selected_mask.sum(dim=1).clamp(min=1).unsqueeze(-1)  # (k, 1)
+
+        # self.prototype_feats[unique_indices] = sum_feats / valid_counts # 直接赋值，硬更新
+        # 动量更新
+        new_proto = sum_feats / valid_counts
+        self.prototype_feats[unique_indices] = (self.momentum_factor * self.prototype_feats[unique_indices] + (1 - self.momentum_factor) * new_proto)
+
+    @torch.no_grad()
+    def diagnose_proto_vs_custom(self, input_feats, indices, labels, num_bins=5):
+        """
+        按频率分桶，比较原型网络 vs MLP 在各桶的 per-class loss。
+        调用方式（验证时）:
+            diag = model.diagnose_proto_vs_custom(feats, indices, labels)
+            for k, v in diag.items():
+                print(f"{k}: custom_loss={v['custom_loss']:.4f}, proto_loss={v['proto_loss']:.4f}, "
+                      f"num_terms={v['num_terms']}, sigma_mean={v['sigma_mean']:.4f}")
+        """
+        was_training = self.training
+        self.eval()
+
+        feats = self.proj(input_feats)
+        custom_logits = self.classifier(feats)
+        proto_logits = self.proto_module(feats, self.prototype_feats)
+
+        sigma = torch.sigmoid(self.gate_k * (self.freq_norm - self.gate_c))  # (num_classes,)
+
+        # 按 freq_norm 分桶
+        freq_norm = self.freq_norm  # (num_classes,)
+        bin_edges = torch.linspace(freq_norm.min(), freq_norm.max(), num_bins + 1, device=freq_norm.device)
+        bin_ids = torch.bucketize(freq_norm, bin_edges[1:-1])  # 0 ~ num_bins-1
+
+        result = {}
+        for b in range(num_bins):
+            mask = (bin_ids == b)
+            n_terms = mask.sum().item()
+            if n_terms == 0:
+                continue
+
+            # 只取该桶的 class 维度
+            custom_loss_bin = self.loss_fn(custom_logits[:, mask], labels[:, mask]).item()
+            proto_loss_bin = self.loss_fn(proto_logits[:, mask], labels[:, mask]).item()
+
+            freq_range = (bin_edges[b].item(), bin_edges[b + 1].item())
+            sigma_mean = sigma[mask].mean().item()
+
+            result[f"bin_{b}_freq_[{freq_range[0]:.2f},{freq_range[1]:.2f})"] = {
+                "custom_loss": custom_loss_bin,
+                "proto_loss": proto_loss_bin,
+                "num_terms": n_terms,
+                "sigma_mean": sigma_mean,
+            }
+
+        if was_training:
+            self.train()
+        return result

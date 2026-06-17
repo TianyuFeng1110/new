@@ -21,9 +21,9 @@ class Dataset(Dataset):
         assert len(seqs) == len(labels), \
             f"seq ({len(seqs)}) and label ({len(labels)}) count mismatch for {dataset_mode}/{namespace}"
 
-        # self.data: list of (idx, sequence, label_indices, go_ids)
+        # self.data: list of (idx, sequence, label_indices)
         data = [
-            (i, seqs[i]['seq'], labels[i], seqs[i].get('GO', []))
+            (i, seqs[i]['seq'], labels[i])
             for i in range(len(seqs))
         ]
 
@@ -46,24 +46,6 @@ class Dataset(Dataset):
         ds.data = self._val_data
         ds._val_data = None
         return ds
-
-    @property
-    def prototype_feats(self):
-        """根据训练集(train mode为根据val_ration划分的新训练集，test mode则为完整的训练集)具体包括的go term，从预计算的蛋白质特征中提取原型特征。
-        TODO 原型的逻辑还需要再思考一下，目前用ESM2的池化特征作为原型特征的输入，但训练集中有的go term可能没有对应的蛋白质，这时就无法计算原型特征了(这块是必须解决的问题)。按照逻辑原型可以用自己训练好的特征，而不仅仅是ESM2的特征。
-        """
-        return None
-        # protein_idx = self._map_indices(self.data) # 用于计算原型每个元素表示go term对应的蛋白质列表(存的是索引)
-        # prototype_feats = []
-        # for idxs in protein_idx:
-        #     proteins_list = []
-        #     for idx in idxs:
-        #         proteins_list.append(self.protein_feats[idx])
-        #     if len(proteins_list) > 0:
-        #         prototype_feats.append(torch.stack(proteins_list).mean(dim=0)) # 计算均值作为原型特征
-        #     else:
-        #         prototype_feats.append(None) # 训练集中如果某个go term没有对应的蛋白质，也就无法计算原型，设为None
-        # return prototype_feats
 
     def __getitem__(self, index):
         return self.data[index]

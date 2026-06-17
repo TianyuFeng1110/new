@@ -1085,7 +1085,9 @@ def build_ic_from_cafa3(cafa3_path, namespace, idx2go, go2id, obo_path):
     return ic
 
 def compute_go_term_frequency(mask, num_proteins):
-    '''获取每个go term的频率'''
+    '''获取每个go term的频率
+       该go term注释到的蛋白质占训练集中总蛋白质的数量
+    '''
     
     return mask.sum(dim=1).float() / num_proteins
 
