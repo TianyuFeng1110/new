@@ -2,43 +2,17 @@ import torch
 
 class collator:
 
-    def __init__(self, num_classes, residue_feats):
+    def __init__(self, num_classes, feats):
         self.num_classes = num_classes
-        self.residue_feats = residue_feats
+        self.protein_feats = feats
 
     def __call__(self, data):
         # data 中每个元素: (idx, seq, label_indices)
         indices = torch.tensor([elem[0] for elem in data])
-        batch_residue_feats, mask = self._process_residue_feats(
-            [self.residue_feats[elem[0]] for elem in data]
-        )
+        batch_feats = torch.stack([self.protein_feats[elem[0]] for elem in data], dim=0)
         labels = self._get_labels(data)
 
-        return batch_residue_feats, mask, labels, indices
-
-    def _process_residue_feats(self, residue_feats):
-        """将不同长度的残基特征统一为固定长度，padding 部分填充 0。
-
-        Args:
-            residue_feats: List[tensor[L_i, d]]，各蛋白质的残基特征，长度 L_i 各不相同
-
-        Returns:
-            padded_feats: tensor[B, max_len, d]
-            mask:         tensor[B, max_len]，bool，True=有效残基，False=padding
-        """
-        batch_size = len(residue_feats)
-        target_len = max(f.size(0) for f in residue_feats)
-        feat_dim = residue_feats[0].size(-1)
-
-        padded_feats = torch.zeros(batch_size, target_len, feat_dim)
-        mask = torch.zeros(batch_size, target_len, dtype=torch.bool)
-
-        for i, feat in enumerate(residue_feats):
-            cur_len = min(feat.size(0), target_len)
-            padded_feats[i, :cur_len] = feat[:cur_len]
-            mask[i, :cur_len] = True
-
-        return padded_feats, mask
+        return batch_feats, labels, indices
 
     def _get_labels(self, data):
         """将整数标签索引列表转为 multi-hot 向量。
