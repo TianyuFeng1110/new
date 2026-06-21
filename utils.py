@@ -1227,12 +1227,12 @@ def print_loss_gradients(model, train_loader, parent_indices, child_indices, dev
     params = [p for p in model.parameters() if p.requires_grad]
 
     records = []
-    for batch_idx, (batch_residue_feats, mask, labels, indices) in enumerate(train_loader):
+    for batch_idx, (batch_residue_feats, labels, indices) in enumerate(train_loader):
         if batch_idx >= num_batches:
             break
 
         final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma = model(
-            batch_residue_feats.to(device), indices.to(device), mask.to(device), labels.to(device)
+            batch_residue_feats.to(device), indices.to(device), labels.to(device)
         )
         hier_loss = compute_hier_loss(custom_logits, parent_indices, child_indices)
 
