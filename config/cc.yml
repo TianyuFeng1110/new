@@ -1,4 +1,11 @@
-hidden_dim: 256
-esm_dim: 320
-warmup_epochs: 10
-rgcn_dim: 256
+hidden_dim: 2048
+esm_dim: 640
+warmup_epochs: 2
+base_lr: 1e-4
+# gate_freeze_epochs: 20
+# rgcn_dim: 256
+
+num_classes: 2574             # TALE cc:2574, CAFA3 cc:2434
+hier_reg_lambda: 0.1          # 层级损失的基础权重
+hier_lambda_warmup: 10        # λ 线性增长的 epoch 数
+hier_lambda_max: 0.5          # λ 增长的上限

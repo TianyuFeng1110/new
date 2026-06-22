@@ -487,81 +487,81 @@ def calculate_metrics(ytrue1, ypred1):
 
 	return {"Fmax": fmax, "micro_AUPRC": auprc(np.array(ytrue).flatten(), np.array(ypred).flatten())}
 
-# 写的bug修复版本
-def auprc_new(ytrue, ypred):
-    """
-    使用官方标准的 average_precision_score (AP) 替代插值法 auc(r, p)
-    这能避免因梯形法则（线性插值）导致的 AUPRC 面积系统性高估问题。
-    """
-    return average_precision_score(ytrue, ypred)
+# # 写的bug修复版本
+# def auprc_new(ytrue, ypred):
+#     """
+#     使用官方标准的 average_precision_score (AP) 替代插值法 auc(r, p)
+#     这能避免因梯形法则（线性插值）导致的 AUPRC 面积系统性高估问题。
+#     """
+#     return average_precision_score(ytrue, ypred)
 
-# 写的bug修复版本
-def calculate_metrics_new(ytrue1, ypred1):
-    fmax = 0.0
-    prec_list = []
-    recall_list = []
+# # 写的bug修复版本
+# def calculate_metrics_new(ytrue1, ypred1):
+#     fmax = 0.0
+#     prec_list = []
+#     recall_list = []
 
-    ytrue = []
-    ypred = []
-    # 1. 过滤掉那些全部为 0 的样本 (不包含真实标签的蛋白质不应参与评价)
-    for i in range(len(ytrue1)):
-        if np.sum(ytrue1[i]) > 0:
-            ytrue.append(ytrue1[i])
-            ypred.append(ypred1[i])    
+#     ytrue = []
+#     ypred = []
+#     # 1. 过滤掉那些全部为 0 的样本 (不包含真实标签的蛋白质不应参与评价)
+#     for i in range(len(ytrue1)):
+#         if np.sum(ytrue1[i]) > 0:
+#             ytrue.append(ytrue1[i])
+#             ypred.append(ypred1[i])    
 
-    # 【差异修复】将类型强转对齐为 float64
-    # 消除 Python 平台 float32 与浮点数阈值 t/100 比较时的底层精度误差问题
-    ytrue = np.array(ytrue, dtype=np.int32)
-    ypred = np.array(ypred, dtype=np.float64)
+#     # 【差异修复】将类型强转对齐为 float64
+#     # 消除 Python 平台 float32 与浮点数阈值 t/100 比较时的底层精度误差问题
+#     ytrue = np.array(ytrue, dtype=np.int32)
+#     ypred = np.array(ypred, dtype=np.float64)
     
-    # 预先计算 TP + FN（代表该蛋白质具有的真实 GO Terms 数量）
-    # 这个值是不随阈值变化的，提前算好提高效率
-    tpfn = np.sum(ytrue, axis=1, dtype=np.float64)
+#     # 预先计算 TP + FN（代表该蛋白质具有的真实 GO Terms 数量）
+#     # 这个值是不随阈值变化的，提前算好提高效率
+#     tpfn = np.sum(ytrue, axis=1, dtype=np.float64)
 
-    for t in range(1, 101):
-        thres = t / 100.0
+#     for t in range(1, 101):
+#         thres = t / 100.0
 
-        # 【差异修复】用 大于等于(>=) 替换严格大于(>)
-        # - 1e-7 是防浮点截断策略，保证 0.01 完全等同于 Matlab 计算下的 0.01
-        pred_labels = np.greater_equal(ypred, thres - 1e-7).astype(np.int32)
+#         # 【差异修复】用 大于等于(>=) 替换严格大于(>)
+#         # - 1e-7 是防浮点截断策略，保证 0.01 完全等同于 Matlab 计算下的 0.01
+#         pred_labels = np.greater_equal(ypred, thres - 1e-7).astype(np.int32)
 
-        # 由于是向量化乘法，用 * 即可实现真阳性的筛选
-        tp_matrix = pred_labels * ytrue
+#         # 由于是向量化乘法，用 * 即可实现真阳性的筛选
+#         tp_matrix = pred_labels * ytrue
         
-        tp = np.sum(tp_matrix, axis=1)         # 每个样本的真阳性(TP)数
-        tpfp = np.sum(pred_labels, axis=1)     # 每个样本预测出的正例总数(TP + FP)
+#         tp = np.sum(tp_matrix, axis=1)         # 每个样本的真阳性(TP)数
+#         tpfp = np.sum(pred_labels, axis=1)     # 每个样本预测出的正例总数(TP + FP)
 
-        # 按照 CAFA 的评估规则：
-        # Precision 仅评估在该阈值下 “至少做出了1个预测的蛋白质”
-        valid_indices = (tpfp != 0)
+#         # 按照 CAFA 的评估规则：
+#         # Precision 仅评估在该阈值下 “至少做出了1个预测的蛋白质”
+#         valid_indices = (tpfp != 0)
         
-        if not np.any(valid_indices):
-            # 如果当前阈值下，没有任何蛋白质有预测结果，跳过
-            continue
+#         if not np.any(valid_indices):
+#             # 如果当前阈值下，没有任何蛋白质有预测结果，跳过
+#             continue
         
-        # 计算针对有效蛋白质的 平均 Precision
-        precisions = tp[valid_indices] / tpfp[valid_indices].astype(np.float64)
-        avgpr = np.mean(precisions)
+#         # 计算针对有效蛋白质的 平均 Precision
+#         precisions = tp[valid_indices] / tpfp[valid_indices].astype(np.float64)
+#         avgpr = np.mean(precisions)
 
-        # 按照 CAFA 的评估规则：
-        # Recall 即使某蛋白质预测数为0，它的 Recall(0) 也要被纳入均值计算
-        # 此前代码中的 np.mean(tp/tpfn) 就是对的，但用 np.float64 避免一些环境下的整除问题
-        recalls = tp / tpfn
-        avgrc = np.mean(recalls)
+#         # 按照 CAFA 的评估规则：
+#         # Recall 即使某蛋白质预测数为0，它的 Recall(0) 也要被纳入均值计算
+#         # 此前代码中的 np.mean(tp/tpfn) 就是对的，但用 np.float64 避免一些环境下的整除问题
+#         recalls = tp / tpfn
+#         avgrc = np.mean(recalls)
 
-        prec_list.append(avgpr)
-        recall_list.append(avgrc)
+#         prec_list.append(avgpr)
+#         recall_list.append(avgrc)
 
-        # 【差异修复】处理 Precision 和 Recall 同为 0 的极端情况
-        if avgpr + avgrc > 0:
-            f1 = 2 * avgpr * avgrc / (avgpr + avgrc)
-        else:
-            f1 = 0.0
+#         # 【差异修复】处理 Precision 和 Recall 同为 0 的极端情况
+#         if avgpr + avgrc > 0:
+#             f1 = 2 * avgpr * avgrc / (avgpr + avgrc)
+#         else:
+#             f1 = 0.0
 
-        # 不断刷新最大 F 得到 Fmax
-        fmax = max(fmax, f1)
+#         # 不断刷新最大 F 得到 Fmax
+#         fmax = max(fmax, f1)
 
-    return {"Fmax": fmax, "micro_AUPRC": auprc(ytrue.flatten(), ypred.flatten())}
+#     return {"Fmax": fmax, "micro_AUPRC": auprc(ytrue.flatten(), ypred.flatten())}
 
 def process_prototype(prototype_dict, go2id):
     '''将字典形式的原型处理为tensor，并与term_list中的顺序保持一致'''
@@ -1268,3 +1268,68 @@ def print_loss_gradients(model, train_loader, parent_indices, child_indices, dev
               f'hier_grad={avg_h:.4f}')
     print('=' * 60)
 
+
+def eval_func_generalizability(model, test_loader, device, go_freq):
+    print("Starting evaluation...")
+
+    # 1. 收集所有预测概率和真实标签
+    all_probs = []
+    all_labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch_feats, labels, indices in test_loader:
+            batch_feats = batch_feats.to(device)
+            labels = labels.to(device)
+            indices = indices.to(device)
+
+            res = model(batch_feats, indices, labels)
+            final_probs = res[0]
+
+            all_probs.append(final_probs.cpu())
+            all_labels.append(labels.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0).numpy()   # (N, num_classes)
+    all_labels = torch.cat(all_labels, dim=0).numpy()  # (N, num_classes)
+
+    # 计算每个蛋白质的 ALF 
+    go_freq_np = go_freq.cpu().numpy()  # (num_classes,)
+
+    alfs = []
+    for i in range(all_labels.shape[0]):
+        label_indices = np.where(all_labels[i] > 0)[0]
+        alf = compute_protein_alf(label_indices.tolist(), go_freq_np)
+        alfs.append(alf)
+    alfs = np.array(alfs)
+
+    # 按 ALF 区间划分，计算各区间的 Fmax
+    #    区间定义: [0, 0.2], (0.2, 0.3], (0.3, 0.4], (0.4, 1]
+    #    为避免边界重叠，第一个区间闭区间，后续区间左开右闭
+    bins = [
+        (0.0, 0.2, "[0, 0.2]"),
+        (0.2, 0.3, "(0.2, 0.3]"),
+        (0.3, 0.4, "(0.3, 0.4]"),
+        (0.4, 1.0, "(0.4, 1]"),
+    ]
+
+    print("\n===== ALF-based Fmax Evaluation =====")
+    for low, high, bin_label in bins:
+        if low == 0.0:
+            mask = (alfs >= low) & (alfs <= high)
+        else:
+            mask = (alfs > low) & (alfs <= high)
+
+        n_proteins = mask.sum()
+        if n_proteins == 0:
+            print(f"  ALF {bin_label}: No proteins in this bin")
+            continue
+
+        bin_probs = all_probs[mask]
+        bin_labels = all_labels[mask]
+        metrics = calculate_metrics(bin_labels, bin_probs)
+        print(f"  ALF {bin_label}: n={n_proteins}, "
+              f"Fmax={metrics['Fmax']:.4f}, micro_AUPRC={metrics['micro_AUPRC']:.4f}")
+
+    metrics_all = calculate_metrics(all_labels, all_probs)
+    print(f"\n  Overall: Fmax={metrics_all['Fmax']:.4f}, "
+          f"micro_AUPRC={metrics_all['micro_AUPRC']:.4f}")
