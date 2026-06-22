@@ -132,7 +132,7 @@ def main(args, config):
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     num_classes = config['num_classes']
-    features_path = '/archive/hot5/fty/'
+    features_path = '/archive/hot5/fty/TALE/'
     # residue_feats = torch.load(os.path.join(features_path, 'residue_feats', f'train_{namespace.lower()}_residue_feats.pt'), weights_only=True, map_location='cpu')
     protein_feats = torch.load(os.path.join(features_path, 'protein_feats', f'train_{namespace.lower()}_protein_feats.pt'), weights_only=True, map_location='cpu')
     # test_residue_feats = torch.load(os.path.join(features_path, 'residue_feats', f'test_{namespace.lower()}_residue_feats.pt'), weights_only=True, map_location='cpu')
@@ -192,7 +192,7 @@ def main(args, config):
                 'config': config,
                 'epoch': epoch,
             }
-    torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/long_epoch/", 'checkpoint_%02d.pth'%epoch))  
+    torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/", 'checkpoint_%02d.pth'%epoch))  
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')
@@ -200,8 +200,9 @@ if __name__ == "__main__" :
     parser.add_argument('--config', type=str, default='./config/cc.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--batch_size', type=int, default=512, help='batch size') # CC:32, BP:4, MF:14
-    parser.add_argument('--epochs', type=int, default=200, help='epoch')
-    parser.add_argument('--path', type=str, default="./data_tale/CAFA3/", help='datasets path')
+    parser.add_argument('--epochs', type=int, default=50, help='epoch')
+    # parser.add_argument('--path', type=str, default="./data_tale/CAFA3/", help='datasets path')
+    parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
     parser.add_argument('--result_path', type=str, default="/archive/hot3/fty/result/", help='result save path')
     parser.add_argument('--mode', type=str, default='test', help='[train/test]')
     parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')

@@ -18,7 +18,7 @@ def load_model_and_evaluate(args, config):
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     num_classes = config['num_classes']
-    features_path = '/archive/hot5/fty/'
+    features_path = '/archive/hot5/fty/TALE/'
     
     # 加载模型初始化所需的特征与原型数据
     protein_feats = torch.load(
@@ -127,10 +127,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Evaluate CC Model')
     parser.add_argument('--device', type=str, default='cuda', help='device id')
     parser.add_argument('--config', type=str, default='./config/cc.yml', help='config yml')
-    parser.add_argument('--path', type=str, default="./data_tale/CAFA3/", help='datasets path')
+    parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
     parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
     parser.add_argument('--batch_size', type=int, default=512, help='batch size')
-    parser.add_argument('--checkpoint_path', type=str, default='/archive/hot5/fty/checkpoints/checkpoint_49.pth', help='path to trained checkpoint (.pth)')
+    parser.add_argument('--checkpoint_path', type=str, default='/archive/hot5/fty/checkpoints/TALE/checkpoint_49.pth', help='path to trained checkpoint (.pth)')
 
     args = parser.parse_args()
 

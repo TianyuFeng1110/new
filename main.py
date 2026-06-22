@@ -46,13 +46,15 @@ def valid(model, loader, epoch, device, scale, hier_reg_lambda, parent_indices, 
     metric_logger.add_meter('max_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('min_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('mean_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     header = 'Valid Epoch: [{}]'.format(epoch)
 
     all_probs, all_labels = [],[]
     diag_accum = {}  # 累积所有 batch 的诊断统计
     for batch_idx, (protein_feats, labels, indices) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
 
-        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma = model(protein_feats.to(device), indices.to(device), labels.to(device))
+        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma, k, c = model(protein_feats.to(device), indices.to(device), labels.to(device))
         hier_loss = utils.compute_hier_loss(custom_logits, parent_indices, child_indices)
         loss = (1 - hier_reg_lambda) * (scale['custom_scale'] * custom_loss + scale['proto_scale'] * proto_loss + scale['gate_scale'] * gate_loss) + hier_reg_lambda * (scale['hier_scale'] * hier_loss)
 
@@ -66,33 +68,11 @@ def valid(model, loader, epoch, device, scale, hier_reg_lambda, parent_indices, 
         metric_logger.update(max_sigma=sigma.max().item())
         metric_logger.update(min_sigma=sigma.min().item())
         metric_logger.update(mean_sigma=sigma.mean().item())
+        metric_logger.update(k=k.item())
+        metric_logger.update(c=c.item())
 
-        # 诊断：累积每个频率桶的 loss=====================================
-        batch_diag = model.diagnose_proto_vs_custom(
-            protein_feats.to(device), indices.to(device), labels.to(device))
-        for k, v in batch_diag.items():
-            if k not in diag_accum:
-                diag_accum[k] = {"custom_loss": 0.0, "proto_loss": 0.0, "num_terms": v["num_terms"], "sigma_mean": 0.0, "count": 0}
-            diag_accum[k]["custom_loss"] += v["custom_loss"]
-            diag_accum[k]["proto_loss"] += v["proto_loss"]
-            diag_accum[k]["sigma_mean"] += v["sigma_mean"]
-            diag_accum[k]["count"] += 1
-
-    # 打印频率桶诊断（按 batch 平均）
-    print("\n--- GO term frequency bucket diagnosis ---")
-    for k in sorted(diag_accum.keys()):
-        v = diag_accum[k]
-        avg_custom = v["custom_loss"] / v["count"]
-        avg_proto = v["proto_loss"] / v["count"]
-        winner = "Proto" if avg_proto < avg_custom else "Custom"
-        print(f"  {k}: custom={avg_custom:.4f}, proto={avg_proto:.4f}, "
-              f"terms={v['num_terms']}, σ={v['sigma_mean']/v['count']:.4f} [{winner}]")
-    print("--- end ---\n")
-    # ======================================================================
-
-    target_log = model.gate_c.item() * (model.freq_log_std + 1e-8) + model.freq_log_mean # 逆 Z-Score 标准化
-    target_freq = torch.exp(target_log) - 1e-6 # 逆对数变换（解出原始频率）
-    target_freq = torch.clamp(target_freq, min=0.0) # sigma=0.5时对应的go term频率是多少
+    target_freq = torch.exp(torch.tensor(model.gate_c.item())) - 1e-6 # sigma=0.5时 log_freq=gate_c, 逆对数得原始频率
+    target_freq = torch.clamp(target_freq, min=0.0)
 
     metric = utils.calculate_metrics(torch.cat(all_labels, dim=0).numpy(), torch.cat(all_probs, dim=0).numpy())
     print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}, target frequency: {:.6f}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC'], target_freq))
@@ -108,15 +88,18 @@ def train(model, optimizer, loader, epoch, device, scale, hier_reg_lambda, paren
     metric_logger.add_meter('custom_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('proto_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('gate_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('hier_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('max_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('min_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('mean_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
 
     for batch_idx, (protein_feats, labels, indices) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
         optimizer.zero_grad(set_to_none=True)
 
-        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma = model(protein_feats.to(device), indices.to(device), labels.to(device))
+        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma, k, c = model(protein_feats.to(device), indices.to(device), labels.to(device))
         hier_loss = utils.compute_hier_loss(custom_logits, parent_indices, child_indices)
         loss = (1 - hier_reg_lambda) * (scale['custom_scale'] * custom_loss + scale['proto_scale'] * proto_loss + scale['gate_scale'] * gate_loss) + hier_reg_lambda * (scale['hier_scale'] * hier_loss)
 
@@ -128,9 +111,12 @@ def train(model, optimizer, loader, epoch, device, scale, hier_reg_lambda, paren
         metric_logger.update(custom_loss=custom_loss.item())
         metric_logger.update(proto_loss=proto_loss.item())
         metric_logger.update(gate_loss=gate_loss.item())
+        metric_logger.update(hier_loss=hier_loss.item())
         metric_logger.update(max_sigma=sigma.max().item())
         metric_logger.update(min_sigma=sigma.min().item())
         metric_logger.update(mean_sigma=sigma.mean().item())
+        metric_logger.update(k=k.item())
+        metric_logger.update(c=c.item())
         
     print("Averaged stats: {}".format(metric_logger.global_avg()))
 
@@ -146,7 +132,7 @@ def main(args, config):
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     num_classes = config['num_classes']
-    features_path = '/archive/hot5/fty/'
+    features_path = '/archive/hot5/fty/TALE/'
     # residue_feats = torch.load(os.path.join(features_path, 'residue_feats', f'train_{namespace.lower()}_residue_feats.pt'), weights_only=True, map_location='cpu')
     protein_feats = torch.load(os.path.join(features_path, 'protein_feats', f'train_{namespace.lower()}_protein_feats.pt'), weights_only=True, map_location='cpu')
     # test_residue_feats = torch.load(os.path.join(features_path, 'residue_feats', f'test_{namespace.lower()}_residue_feats.pt'), weights_only=True, map_location='cpu')
@@ -166,19 +152,17 @@ def main(args, config):
         input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes, prototype_index=prototype_index,
           proto_idx_mask=proto_idx_mask, go_freq=go_freq
     ).to(device)
-    model.init_protein_feats(stacked_feats)
-    model.init_prototype_feats(num_classes, hidden_dim)
+    model.init_prototype_feats(num_classes, hidden_dim, stacked_feats)
 
     prototype_params = list(model.proto_module.parameters())
-    # gate_params = list(model.gate_k.parameters(), model.gate_c.parameters())
     special_param_ids = set(id(p) for p in prototype_params)
     default_params = [p for p in model.parameters() if id(p) not in special_param_ids]
     optimizer = optim.AdamW([
-        {'params': prototype_params, 'lr': base_lr * 10}, # 原型模块
+        {'params': prototype_params, 'lr': base_lr * 5}, # 原型模块
         {'params': default_params} # 其余所有模块 — 动态打包，继承最外层的默认学习率
     ], lr=base_lr)
 
-    # optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)  
+    # optimizer = optim.AdamW(model.parameters(), lr=base_lr)  
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
     _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
@@ -188,7 +172,7 @@ def main(args, config):
 
     # utils.print_loss_gradients(model, train_loader, parent_indices, child_indices, device)
     # hier_scale = utils.get_hier_scale(model, train_loader, parent_indices, child_indices, device) # 静态标定法缩放梯度
-    scale = {'proto_scale': 0.185, 'gate_scale': 0.291, 'custom_scale': 1, 'hier_scale': 7003.65}
+    scale = {'proto_scale': 3.5, 'gate_scale': 0.95, 'custom_scale': 1, 'hier_scale': 7500} # 缩放后的梯度几乎是1比1
     
     print('start traing......')
     for epoch in range(epochs):
@@ -208,16 +192,17 @@ def main(args, config):
                 'config': config,
                 'epoch': epoch,
             }
-    torch.save(save_obj, os.path.join("/archive/hot3/fty/checkpoints/", 'checkpoint_%02d.pth'%epoch))  
+    torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/", 'checkpoint_%02d.pth'%epoch))  
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')
     parser.add_argument('--device', type=str, default='cuda', help='device id')
     parser.add_argument('--config', type=str, default='./config/cc.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
-    parser.add_argument('--batch_size', type=int, default=64, help='batch size') # CC:32, BP:4, MF:14
+    parser.add_argument('--batch_size', type=int, default=512, help='batch size') # CC:32, BP:4, MF:14
     parser.add_argument('--epochs', type=int, default=50, help='epoch')
-    parser.add_argument('--path', type=str, default="./data_tale/CAFA3/", help='datasets path')
+    # parser.add_argument('--path', type=str, default="./data_tale/CAFA3/", help='datasets path')
+    parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
     parser.add_argument('--result_path', type=str, default="/archive/hot3/fty/result/", help='result save path')
     parser.add_argument('--mode', type=str, default='test', help='[train/test]')
     parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
