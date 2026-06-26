@@ -6,7 +6,7 @@ import torch.optim as optim
 import numpy as np
 
 from ruamel.yaml import YAML
-from models.model import Model
+from models.prototype_model import Model
 from datasets.dataset import Dataset
 from datasets.collator import collator
 from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
@@ -34,45 +34,41 @@ def get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein
     return train_loader, valid_loader
 
 @torch.no_grad()
-def valid(model, loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices):
+def valid(model, loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices, go_freq):
 
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('total_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('custom_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('proto_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('gate_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('hier_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('max_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('min_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('mean_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     header = 'Valid Epoch: [{}]'.format(epoch)
 
     all_probs, all_labels = [],[]
     diag_accum = {}  # 累积所有 batch 的诊断统计
     for batch_idx, (protein_feats, labels, indices) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
 
-        # final_probs, proto_loss = model(protein_feats.to(device), indices.to(device), labels.to(device))
-        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma, k, c = model(protein_feats.to(device), indices.to(device), labels.to(device))
-        total_loss = gate_loss
+        final_probs, proto_loss, tau, bias = model(protein_feats.to(device), indices.to(device), labels.to(device))
+        total_loss = proto_loss
 
         all_probs.append(final_probs.detach().cpu())  # final_probs 已经是概率值，不需要再 sigmoid
         all_labels.append(labels.detach().cpu())
         metric_logger.update(total_loss=total_loss.item())
-        metric_logger.update(custom_loss=0.0)
-        metric_logger.update(proto_loss=0)
-        metric_logger.update(gate_loss=gate_loss.item())
-        metric_logger.update(hier_loss=0.0)
-        metric_logger.update(max_sigma=sigma.max().item())
-        metric_logger.update(min_sigma=sigma.min().item())
-        metric_logger.update(mean_sigma=sigma.mean().item())
-        metric_logger.update(k=k.item())
-        metric_logger.update(c=c.item())
+        metric_logger.update(proto_loss=proto_loss)
+        metric_logger.update(tau_max=tau.max())
+        metric_logger.update(tau_min=tau.min())
+        metric_logger.update(tau_mean=tau.mean())
+        metric_logger.update(bias_max=bias.max())
+        metric_logger.update(bias_min=bias.min())
+        metric_logger.update(bias_mean=bias.mean())
 
     # target_freq = torch.exp(torch.tensor(model.gate_c.item())) - 1e-6 # sigma=0.5时 log_freq=gate_c, 逆对数得原始频率
     # target_freq = torch.clamp(target_freq, min=0.0)
+    # utils.eval_func_generalizability(model, loader, device, go_freq)
 
     metric = utils.calculate_metrics(torch.cat(all_labels, dim=0).numpy(), torch.cat(all_probs, dim=0).numpy())
     print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}, target frequency: {:.6f}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC'], 0.0))
@@ -85,38 +81,34 @@ def train(model, optimizer, loader, epoch, device, scale, hier_reg_lambda, paren
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
     metric_logger.add_meter('total_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('custom_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('proto_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('gate_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('hier_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('max_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('min_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('mean_sigma', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('k', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('c', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('tau_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_max', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_min', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('bias_mean', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
 
     for batch_idx, (protein_feats, labels, indices) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
         optimizer.zero_grad(set_to_none=True)
 
-        # final_probs, proto_loss = model(protein_feats.to(device), indices.to(device), labels.to(device))
-        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma, k, c = model(protein_feats.to(device), indices.to(device), labels.to(device))
-        total_loss = gate_loss
+        final_probs, proto_loss,tau, bias = model(protein_feats.to(device), indices.to(device), labels.to(device))
+
+        total_loss = proto_loss
         total_loss.backward()
         optimizer.step()
         model._momentum_update()
         
         metric_logger.update(lr=optimizer.param_groups[-1]["lr"])  
         metric_logger.update(total_loss=total_loss.item())
-        metric_logger.update(custom_loss=0)
-        metric_logger.update(proto_loss=0)
-        metric_logger.update(gate_loss=gate_loss.item())
-        metric_logger.update(hier_loss=0)
-        metric_logger.update(max_sigma=sigma.max().item())
-        metric_logger.update(min_sigma=sigma.min().item())
-        metric_logger.update(mean_sigma=sigma.mean().item())
-        metric_logger.update(k=k.item())
-        metric_logger.update(c=c.item())
+        metric_logger.update(proto_loss=proto_loss)
+        metric_logger.update(tau_max=tau.max())
+        metric_logger.update(tau_min=tau.min())
+        metric_logger.update(tau_mean=tau.mean())
+        metric_logger.update(bias_max=bias.max())
+        metric_logger.update(bias_min=bias.min())
+        metric_logger.update(bias_mean=bias.mean())
         
     print("Averaged stats: {}".format(metric_logger.global_avg()))
 
@@ -155,17 +147,17 @@ def main(args, config):
     model = Model(
         input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes, #prototype_index=prototype_index,
            raw_feats=stacked_feats, go_embeddings=go_embeddings, queue_size=queue_size, queue_indices=queue_indices
-           , go_freq=go_freq,
+        #    , go_freq=go_freq,
     ).to(device)
+#   NOTE 
+    # special_params = [model.class_specific_residual]
+    # default_params = [p for p in model.parameters() if id(p) not in [id(x) for x in special_params] and p.requires_grad]
+    # optimizer = optim.AdamW([
+    #     {'params': special_params, 'weight_decay': 1e-2},
+    #     {'params': default_params, 'weight_decay': 1e-4}
+    # ], lr=base_lr)
 
-    special_params = [model.class_specific_residual]
-    default_params = [p for p in model.parameters() if id(p) not in [id(x) for x in special_params] and p.requires_grad]
-    optimizer = optim.AdamW([
-        {'params': special_params, 'weight_decay': 1e-2},
-        {'params': default_params, 'weight_decay': 1e-4}
-    ], lr=base_lr)
-
-    # optimizer = optim.AdamW(model.parameters(), lr=base_lr)  
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr)  
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
     _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
@@ -185,7 +177,7 @@ def main(args, config):
         scheduler.step()
 
         # 验证
-        all_probs, all_labels = valid(model, valid_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices)
+        all_probs, all_labels = valid(model, valid_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices, go_freq)
     
     # utils.draw_frequencies_AUPRC(torch.cat(all_probs, dim=0).numpy(), torch.cat(all_probs_averge, dim=0).numpy(), torch.cat(all_labels, dim=0).numpy(), valid_freq, save_path=result_path, namespace=namespace) # 训练结束绘制结果曲线图
         save_obj = {
@@ -195,7 +187,7 @@ def main(args, config):
                     'config': config,
                     'epoch': epoch,
                 }
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/custom+prototype", 'checkpoint_%02d.pth'%epoch))  
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype", 'checkpoint_%02d.pth'%epoch))  
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')

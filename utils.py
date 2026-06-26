@@ -25,6 +25,8 @@ from goatools.obo_parser import GODag
 from goatools.semantic import TermCounts
 from typing import List, Dict
 from sklearn.metrics import auc
+from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances_argmin_min
 
 def lr_scheduler(current_epoch, warmup_epochs, max_epochs):
     """
@@ -1231,7 +1233,7 @@ def print_loss_gradients(model, train_loader, parent_indices, child_indices, dev
         if batch_idx >= num_batches:
             break
 
-        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma = model(
+        final_probs, custom_logits, custom_loss, proto_loss, gate_loss, sigma, _, _ = model(
             batch_residue_feats.to(device), indices.to(device), labels.to(device)
         )
         hier_loss = compute_hier_loss(custom_logits, parent_indices, child_indices)
@@ -1333,3 +1335,252 @@ def eval_func_generalizability(model, test_loader, device, go_freq):
     metrics_all = calculate_metrics(all_labels, all_probs)
     print(f"\n  Overall: Fmax={metrics_all['Fmax']:.4f}, "
           f"micro_AUPRC={metrics_all['micro_AUPRC']:.4f}")
+
+
+def eval_term_freq_generalizability(model, test_loader, device, go_freq):
+    """按 GO term 自身的功能频率划分频率桶，评估模型在不同频率桶上的泛化能力。
+
+    与 eval_func_generalizability 的区别：
+    - eval_func_generalizability 按蛋白质的 ALF（平均标签频率）给蛋白质分桶（行切片），
+      计算每个桶的 Fmax / micro_AUPRC
+    - 本方法按每个 GO term 在训练集中的频率 f(x) 给 GO term 分桶（列切片），
+      同样计算每个桶的 Fmax / micro_AUPRC，同时输出 mean per-class AUPRC
+
+    Args:
+        model:       待评估模型
+        test_loader: 测试集 DataLoader，每个 batch 返回 (batch_feats, labels, indices)
+        device:      torch device
+        go_freq:     Tensor (num_classes,)，每个 GO term 的训练集频率 f(x)
+    """
+    print("Starting GO-term frequency-based evaluation...")
+
+    # 1. 收集所有预测概率和真实标签
+    all_probs = []
+    all_labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch_feats, labels, indices in test_loader:
+            batch_feats = batch_feats.to(device)
+            labels = labels.to(device)
+            indices = indices.to(device)
+
+            res = model(batch_feats, indices, labels)
+            final_probs = res[0]
+
+            all_probs.append(final_probs.cpu())
+            all_labels.append(labels.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0).numpy()   # (N, num_classes)
+    all_labels = torch.cat(all_labels, dim=0).numpy()  # (N, num_classes)
+
+    go_freq_np = go_freq.cpu().numpy()  # (num_classes,)
+
+    # 2. 按 GO term 频率划分区间
+    # 0-10,10-50,50-100，100-1000，1000-all
+    bins = [
+        (0.0, 0.0002, "[0, 0.0002]"),
+        (0.0002, 0.001, "(0.0002, 0.001]"),
+        (0.001, 0.002, "(0.001, 0.002]"),
+        (0.002, 0.02, "(0.002, 0.02]"),
+        (0.02, 1.0, "(0.02, 1]"),
+    ]
+
+    print("\n===== GO-term Frequency-based Evaluation =====")
+    for low, high, bin_label in bins:
+        if low == 0.0:
+            col_mask = (go_freq_np >= low) & (go_freq_np <= high)
+        else:
+            col_mask = (go_freq_np > low) & (go_freq_np <= high)
+
+        col_indices = np.where(col_mask)[0]
+        n_terms = len(col_indices)
+        if n_terms == 0:
+            print(f"  Freq {bin_label}: No GO terms in this bin")
+            continue
+
+        # 列切片：只保留该频率桶内的 GO term
+        bin_probs = all_probs[:, col_indices]
+        bin_labels = all_labels[:, col_indices]
+        metrics = calculate_metrics(bin_labels, bin_probs)
+        print(f"  Freq {bin_label}: n_terms={n_terms}, "
+              f"Fmax={metrics['Fmax']:.4f}, micro_AUPRC={metrics['micro_AUPRC']:.4f}")
+
+    # 3. 全量（所有 GO term）的指标
+    metrics_all = calculate_metrics(all_labels, all_probs)
+    print(f"\n  Overall: Fmax={metrics_all['Fmax']:.4f}, "
+          f"micro_AUPRC={metrics_all['micro_AUPRC']:.4f}")
+
+def get_prototype_index(data, num_classes):
+    prototype_index = torch.zeros(len(data), num_classes)
+    for i, item in enumerate(data):
+        labels = item.get('label', [])
+        # 使用高级索引将对应位置置为 1
+        prototype_index[i, labels] = 1.0
+
+    return prototype_index
+
+def get_queue_index(features, one_hot, namespace, datasets_path, K=16):
+    '''
+    为每个类别静态选取入队的索引(该队列用于前向传递后计算原型)
+    '''
+    # 如果已经保存了队列索引，直接加载，否则实时计算，然后保存。
+    file_path = os.path.join(datasets_path, f'{namespace.lower()}_queue_index.pt')
+    if os.path.exists(file_path):
+        return torch.load(file_path)
+
+    classes_num = one_hot.size(1)
+    queue_index = []
+
+    for c in range(classes_num):
+        # 1. 获取当前类别在原始 features 中的全局索引 (1D Tensor)
+        # 例如，如果原始第 2, 5, 8 个样本属于该类别，则 global_indices = tensor([2, 5, 8])
+        global_indices = (one_hot[:, c] == 1).nonzero(as_tuple=True)[0]
+        
+        # 2. 提取对应的特征向量
+        f = features[global_indices]
+        
+        f_norm = F.normalize(f, p=2, dim=1)
+        
+        if f_norm.size(0) >= K:
+            labels, centroids, closest_indices = kmeans_sklearn(f_norm, K)
+            # closest_indices 通常是 list 或 numpy 数组，表示在当前类别子集中的索引
+            # 3. 映射回全局索引：利用 PyTorch 的花式索引（Fancy Indexing）
+            global_mapped = global_indices[closest_indices]
+        else:
+            # 当数量少于 K 时，保留该类别所有的样本，其对应的全局索引即为 global_indices
+            # global_mapped = global_indices
+            pad_len = max(0, 16 - global_indices.size(0))
+            global_mapped = F.pad(global_indices, (0, pad_len), mode='constant', value=-1)
+            
+        # 根据您的需要，可以将映射后的全局索引保存
+        queue_index.append(global_mapped)  # 按类别保存为 list of list
+        # 或者使用 queue_index.extend(global_mapped) 合并为一个一维列表
+        
+    res = torch.stack(queue_index, dim=0)
+    torch.save(res, file_path)
+
+    return res
+
+def kmeans_sklearn(X: torch.Tensor, K: int = 16):
+    """对输入的张量进行 K-means 聚类，并寻找距离每个聚类形心最近的数据索引。
+
+    参数:
+        X: 形状为 (data_num, dim) 的数据，可以是 PyTorch 张量或 NumPy 数组。
+        n_clusters: 聚类类别数，默认为 16。
+
+    返回:
+        labels: 每个数据点对应的聚类类别标签，形状为 (data_num,)。
+        centers: 聚类形心，形状为 (n_clusters, dim)。
+        closest_indices: 每个聚类类别中，距离形心最近的数据索引，形状为 (n_clusters,)。
+    """
+    # 如果输入是 PyTorch 张量，转换为 NumPy 数组以便 scikit-learn 处理
+    if hasattr(X, "detach"):
+        X_np = X.detach().cpu().numpy()
+    else:
+        X_np = np.asarray(X)
+
+    # 1. 实例化并进行 K-means 聚类
+    kmeans = KMeans(n_clusters=K, random_state=42, n_init="auto")
+    labels = kmeans.fit_predict(X_np)
+    centers = kmeans.cluster_centers_
+
+    # 2. 寻找距离每个聚类形心最近的数据点索引
+    # pairwise_distances_argmin_min(A, B) 会计算 A 中每个元素到 B 中所有元素的最短距离
+    # 这里 A 为形心(centers)，B 为原始数据集(X_np)，返回的第一个值即为最接近形心的数据点索引
+    closest_indices, _ = pairwise_distances_argmin_min(centers, X_np)
+
+    return labels, centers, closest_indices
+
+
+@torch.no_grad()
+def analyze_queue_coverage(model, go_freq):
+    """统计每个类的队列中实际正样本数"""
+    idx = model.queue_indices  # (num_classes, queue_size)
+    valid_counts = (idx >= 0).sum(dim=1).cpu().numpy()  # 每个类队列中的有效样本数
+    
+    # 按频率分桶统计
+    for (bucket_name, lo, hi) in [("rare [0,0.01)", 0, 0.01), 
+                                   ("mid [0.01,0.1)", 0.01, 0.1),
+                                   ("freq [0.1,1]", 0.1, 1.0)]:
+        mask = (go_freq >= lo) & (go_freq < hi)
+        if mask.sum() > 0:
+            print(f"{bucket_name}: mean_valid={valid_counts[mask].mean():.1f}, "
+                  f"zero_count={(valid_counts[mask] == 0).sum()}/{mask.sum()}")
+
+@torch.no_grad()
+def analyze_proto_quality(model, loader, device, go_freq, num_classes):
+    """对每个类分别统计：正样本与原型、负样本与原型的余弦相似度分布"""
+    model.eval()
+    pos_cos = [[] for _ in range(num_classes)]
+    neg_cos = [[] for _ in range(num_classes)]
+    
+    for protein_feats, labels, indices in loader:
+        protein_feats = model.protein_mlp(protein_feats.to(device))  # (B, D)
+        go_feats = model.go_mlp(model.go_embeddings)                 # (C, D)
+        func_specific = protein_feats.unsqueeze(1) * go_feats.unsqueeze(0)  # (B, C, D)
+        prototypes = model._compute_prototypes()                     # (C, D)
+        
+        func_norm = F.normalize(func_specific, p=2, dim=-1)
+        proto_norm = F.normalize(prototypes, p=2, dim=-1)
+        cos_sim = (func_norm * proto_norm.unsqueeze(0)).sum(dim=-1)  # (B, C)
+        
+        for c in range(num_classes):
+            mask_pos = labels[:, c] == 1
+            mask_neg = labels[:, c] == 0
+            if mask_pos.sum() > 0:
+                pos_cos[c].extend(cos_sim[mask_pos, c].cpu().tolist())
+            if mask_neg.sum() > 0:
+                neg_cos[c].extend(cos_sim[mask_neg, c].cpu().tolist())
+    
+    # 按频率分桶汇总
+    for (bucket_name, lo, hi) in [("rare", 0, 0.01), ("mid", 0.01, 0.1), ("freq", 0.1, 1.0)]:
+        mask = (go_freq >= lo) & (go_freq < hi)
+        classes_in_bucket = mask.nonzero(as_tuple=True)[0]
+        pos_all = np.concatenate([np.array(pos_cos[c]) for c in classes_in_bucket if len(pos_cos[c]) > 0])
+        neg_all = np.concatenate([np.array(neg_cos[c]) for c in classes_in_bucket if len(neg_cos[c]) > 0])
+        if len(pos_all) > 0 and len(neg_all) > 0:
+            print(f"{bucket_name}: pos_cos_mean={pos_all.mean():.4f}, neg_cos_mean={neg_all.mean():.4f}, "
+                  f"separation={pos_all.mean() - neg_all.mean():.4f}")
+            
+@torch.no_grad()
+def analyze_proto_collapse(model, go_freq):
+    """计算原型之间的两两余弦相似度，检查是否坍缩"""
+    prototypes = F.normalize(model._compute_prototypes(), p=2, dim=-1)  # (C, D)
+    sim_matrix = prototypes @ prototypes.T  # (C, C)
+    
+    for (bucket_name, lo, hi) in [("rare", 0, 0.01), ("mid", 0.01, 0.1), ("freq", 0.1, 1.0)]:
+        mask = (go_freq >= lo) & (go_freq < hi)
+        classes = mask.nonzero(as_tuple=True)[0]
+        if len(classes) > 1:
+            intra = sim_matrix[classes][:, classes]  # 同类桶内
+            # 桶内类间平均相似度
+            n = len(classes)
+            intra_sim = (intra.sum() - intra.diag().sum()) / (n * (n - 1))
+            
+            # 与高频类的相似度
+            freq_mask = go_freq >= 0.1
+            freq_classes = freq_mask.nonzero(as_tuple=True)[0]
+            if len(freq_classes) > 0:
+                cross_sim = sim_matrix[classes][:, freq_classes].mean()
+            else:
+                cross_sim = 0
+            print(f"{bucket_name} (n={n}): intra_sim={intra_sim:.4f}, cross_with_freq={cross_sim:.4f}")
+
+@torch.no_grad()
+def analyze_go_separation(model, go_freq):
+    go_feats = model.go_mlp(model.go_embeddings)  # (C, D)
+    go_norm = F.normalize(go_feats, dim=-1)
+    sim = go_norm @ go_norm.T  # (C, C)
+    
+    for name, (lo, hi) in [("rare", 0, 0.01), ("mid", 0.01, 0.1), ("freq", 0.1, 1)]:
+        mask = (go_freq >= lo) & (go_freq < hi)
+        idx = mask.nonzero(as_tuple=True)[0]
+        if len(idx) > 1:
+            intra = (sim[idx][:, idx].sum() - len(idx)) / (len(idx) * (len(idx) - 1))
+            print(f"{name} (n={len(idx)}): intra_go_sim={intra:.4f}")
+
+    # rare vs rare, freq vs freq, rare vs freq
+    rare_mask = go_freq < 0.01
+    freq_mask = go_freq >= 0.1
+    print(f"rare-freq cross go_sim: {sim[rare_mask][:, freq_mask].mean():.4f}")

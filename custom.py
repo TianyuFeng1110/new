@@ -116,7 +116,7 @@ def main(args, config):
         input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes
     ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=base_lr)  
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)  
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
     _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
@@ -126,7 +126,7 @@ def main(args, config):
 
     # utils.print_loss_gradients(model, train_loader, parent_indices, child_indices, device)
     # hier_scale = utils.get_hier_scale(model, train_loader, parent_indices, child_indices, device) # 静态标定法缩放梯度
-    scale = {'custom_scale': 1, 'hier_scale': 7500}
+    scale = {'custom_scale': 1, 'hier_scale': 0}
     
     print('start traing......')
     for epoch in range(epochs):
@@ -139,21 +139,21 @@ def main(args, config):
         all_probs, all_labels = valid(model, valid_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices)
     
     # utils.draw_frequencies_AUPRC(torch.cat(all_probs, dim=0).numpy(), torch.cat(all_probs_averge, dim=0).numpy(), torch.cat(all_labels, dim=0).numpy(), valid_freq, save_path=result_path, namespace=namespace) # 训练结束绘制结果曲线图
-    save_obj = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(), 
-                'config': config,
-                'epoch': epoch,
-            }
-    torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/custom/", 'checkpoint_%02d.pth'%epoch))  
+        save_obj = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(), 
+                    'config': config,
+                    'epoch': epoch,
+                }
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/custom/", 'checkpoint_%02d.pth'%epoch))  
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')
     parser.add_argument('--device', type=str, default='cuda', help='device id')
-    parser.add_argument('--config', type=str, default='./config/cc.yml', help='config yml')
+    parser.add_argument('--config', type=str, default='./config/custom.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
-    parser.add_argument('--batch_size', type=int, default=512, help='batch size') # CC:32, BP:4, MF:14
+    parser.add_argument('--batch_size', type=int, default=1024, help='batch size') # CC:32, BP:4, MF:14
     parser.add_argument('--epochs', type=int, default=50, help='epoch')
     # parser.add_argument('--path', type=str, default="./data_tale/CAFA3/", help='datasets path')
     parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
