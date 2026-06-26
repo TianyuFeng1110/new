@@ -115,8 +115,8 @@ class Model(nn.Module):
         prot_feats = self.momentum_protein_mlp(prot_feats.view(class_num * Q_size, -1)).view(class_num, Q_size, -1)
 
         # 哈达玛积
-        # func_all = prot_feats * go_feats.unsqueeze(1) * valid_mask
-        # proto_sums = func_all.sum(dim=1)                              # (num_classes, hidden_dim)
-        proto_sums = (prot_feats * valid_mask).sum(dim=1)
+        func_all = prot_feats * go_feats.unsqueeze(1) * valid_mask
+        proto_sums = func_all.sum(dim=1)                              # (num_classes, hidden_dim)
+        # proto_sums = (prot_feats * valid_mask).sum(dim=1)
         counts = valid_mask.sum(dim=1).clamp(min=1.0)                 # (num_classes, 1)
         return proto_sums / counts
