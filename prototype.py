@@ -187,7 +187,7 @@ def main(args, config):
                     'config': config,
                     'epoch': epoch,
                 }
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype", 'checkpoint_%02d.pth'%epoch))  
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype1", 'checkpoint_%02d.pth'%epoch))  
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')
@@ -195,7 +195,7 @@ if __name__ == "__main__" :
     parser.add_argument('--config', type=str, default='./config/cc.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--batch_size', type=int, default=256, help='batch size') # CC:32, BP:4, MF:14
-    parser.add_argument('--epochs', type=int, default=50, help='epoch')
+    parser.add_argument('--epochs', type=int, default=100, help='epoch')
     parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
     parser.add_argument('--result_path', type=str, default="/archive/hot3/fty/result/", help='result save path')
     parser.add_argument('--mode', type=str, default='test', help='[train/test]')
