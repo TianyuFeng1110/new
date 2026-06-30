@@ -1165,6 +1165,100 @@ def compute_hier_loss(logits, parent_indices, child_indices):
     """R = 1/|E| * sum_{(i,j)∈E} max(0, y_j - y_i)，i父j子"""
     return torch.relu(logits[:, child_indices] - logits[:, parent_indices]).mean()
 
+
+def balanced_bce_loss(logits, labels, mask, N, k):
+    """BCE loss with padding removal + per-class averaging.
+
+    Batch 结构: N 个类别 × 2k 个样本（k 正 + k 负）。
+    策略 1 — 按类别求平均：每个类别内部先求 mean，再跨 N 个类别求 mean，
+              确保罕见类与常见类对梯度的贡献为 1:1。
+    策略 2 — 剔除 padding：mask=False 的占位样本不参与损失计算。
+
+    Args:
+        logits: [B, num_classes] 原始 logits
+        labels: [B, num_classes] multi-hot 标签
+        mask:   [B] bool, True=真实样本, False=padding 占位
+        N:      每 batch 采样的类别数
+        k:      每类正/负样本数上限
+    Returns:
+        scalar loss
+    """
+    device = logits.device
+    samples_per_class = 2 * k  # k 正 + k 负
+
+    # 从 batch 排列顺序重建类别归属: [0,0,...,1,1,...,N-1,N-1,...]
+    class_ids = torch.arange(N, device=device).repeat_interleave(samples_per_class)
+
+    # 策略 2: 剔除 padding 行
+    class_ids = class_ids[mask]      # [B']
+    logits = logits[mask]            # [B', num_classes]
+    labels = labels[mask]            # [B', num_classes]
+
+    # 逐元素 BCE (no reduction) → 每样本在所有类别维度上取 mean
+    bce = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+    per_sample_loss = bce.mean(dim=1)  # [B']
+
+    # 策略 1: 按类别求平均
+    loss = torch.zeros(N, device=device)
+    for c in range(N):
+        c_mask = (class_ids == c)
+        if c_mask.sum() > 0:
+            loss[c] = per_sample_loss[c_mask].mean()
+
+    return loss.mean()
+
+
+def balanced_asl_loss(logits, labels, mask, N, k,
+                      gamma_neg=4, gamma_pos=0, clip=0.0, eps=1e-8):
+    """ASL loss with padding removal + per-class averaging.
+
+    与 balanced_bce_loss 逻辑一致，仅将 BCE 替换为 Asymmetric Loss。
+    ASL 通过 gamma_neg 压制简单负样本的梯度，缓解正负极端不平衡问题。
+
+    Args:
+        logits:    [B, num_classes] 原始 logits
+        labels:    [B, num_classes] multi-hot 标签
+        mask:      [B] bool, True=真实样本, False=padding 占位
+        N:         每 batch 采样的类别数
+        k:         每类正/负样本数上限
+        gamma_neg: 负样本 focusing 指数（默认 4，越大对简单负样本压制越强）
+        gamma_pos: 正样本 focusing 指数（默认 0，标准 ASL 不对正样本加压）
+        clip:      概率下界裁剪（默认 0.0，即不裁剪）
+        eps:       数值稳定项
+    Returns:
+        scalar loss
+    """
+    device = logits.device
+    samples_per_class = 2 * k
+
+    class_ids = torch.arange(N, device=device).repeat_interleave(samples_per_class)
+
+    # 策略 2: 剔除 padding 行
+    class_ids = class_ids[mask]
+    logits = logits[mask]
+    labels = labels[mask]
+
+    # 逐元素 ASL（手动实现，timm 的 AsymmetricLossMultiLabel 不支持 reduction='none'）
+    p = torch.sigmoid(logits)
+    # 正样本部分: -y * (1-p)^gamma_pos * log(p)
+    los_pos = -labels * torch.pow(1 - p, gamma_pos) * torch.log(p.clamp(min=eps))
+    # 负样本部分: -(1-y) * p_clipped^gamma_neg * log(1-p)
+    p_neg = p
+    if clip > 0:
+        p_neg = (p_neg + clip).clamp(max=1)
+    los_neg = -(1 - labels) * torch.pow(p_neg, gamma_neg) * torch.log((1 - p).clamp(min=eps))
+    asl = los_pos + los_neg                                  # [B', num_classes]
+    per_sample_loss = asl.mean(dim=1)                        # [B']
+
+    # 策略 1: 按类别求平均
+    loss = torch.zeros(N, device=device)
+    for c in range(N):
+        c_mask = (class_ids == c)
+        if c_mask.sum() > 0:
+            loss[c] = per_sample_loss[c_mask].mean()
+
+    return loss.mean()
+
 def get_hier_scale(model, train_loader, parent_indices, child_indices, device, num_calib_batches=10):
     """多 batch 静态标定：遍历多个 batch 累积梯度模长，取总模长比作为缩放因子，
     避免单 batch（尤其 batch_size=4~16）带来的高方差。
@@ -1285,7 +1379,7 @@ def eval_func_generalizability(model, test_loader, device, go_freq):
             labels = labels.to(device)
             indices = indices.to(device)
 
-            res = model(batch_feats, indices, labels)
+            res = model(batch_feats, None, labels)
             final_probs = res[0]
 
             all_probs.append(final_probs.cpu())
@@ -1420,6 +1514,66 @@ def get_prototype_index(data, num_classes):
 
     return prototype_index
 
+def get_hard_neg_indices(pos_indices, go2id):
+    """
+    基于基因本体 DAG 层次结构获取困难负样本索引（仅直接父节点）。
+
+    对于 GO term B，其困难负样本定义为：
+      注释到 B 的 **直接父节点** (father) 的蛋白质，
+      但 **未** 注释到 B 本身。
+
+    直觉：蛋白质具有父节点的泛化功能，但不具有当前子节点的特化功能，
+    这类"有泛化但缺特化"的样本对分类器最具迷惑性（困难负样本）。
+
+    示例：
+      C (父) → B → A (子)，即 C 是 B 的直接父节点，B 是 A 的直接父节点。
+      对于 GO term B，困难负样本 = 注释到 C (直接父节点) 的蛋白质，但未注释到 B。
+
+    Args:
+        pos_indices: Tensor, shape (num_classes, num_data), 二值矩阵，
+                     pos_indices[i][j] = 1 表示蛋白质 j 是第 i 个类的正样本。
+        go2id:       dict, key 为 GO term 字符串 (如 'GO:0000109')，
+                     value 为 dict { 'father': [str], 'child': [str], 'ind': int }。
+                     'ind' 是该 GO term 在 num_classes 中的索引。
+
+    Returns:
+        hard_neg_indices: Tensor, shape (num_classes, num_data), 二值矩阵，
+                          hard_neg_indices[i][j] = 1 表示蛋白质 j 是第 i 个类的困难负样本。
+    """
+    num_classes, num_data = pos_indices.shape
+
+    # 1. 构建 class_index -> GO term string 的反向映射
+    idx2go = {} # {类别索引: GO term}
+    for go_str, info in go2id.items():
+        if isinstance(info, dict) and 'ind' in info:
+            idx2go[info['ind']] = go_str
+
+    # 2. 构建困难负样本矩阵：仅使用直接父节点
+    hard_neg_indices = torch.zeros(num_classes, num_data, dtype=pos_indices.dtype)
+
+    for i in range(num_classes):
+        go_str = idx2go.get(i)
+
+        fathers = go2id[go_str].get('father', [])
+        # 收集直接父节点的类别索引
+        father_indices = []
+        for f in fathers:
+            if f in go2id:
+                f_info = go2id[f]
+                if isinstance(f_info, dict) and 'ind' in f_info:
+                    father_indices.append(f_info['ind'])
+
+        if not father_indices:
+            continue
+
+        # 表示当前类别i父节点的所有正样本
+        father_pos = pos_indices[father_indices].any(dim=0)  # (num_data,)
+        # 当前类自身为负 → 未注释到该类
+        class_neg = (pos_indices[i] == 0)  # (num_data,)
+        hard_neg_indices[i] = (father_pos & class_neg).to(pos_indices.dtype)
+
+    return hard_neg_indices
+
 def get_queue_index(features, one_hot, namespace, datasets_path, K=16):
     '''
     为每个类别静态选取入队的索引(该队列用于前向传递后计算原型)
@@ -1450,7 +1604,7 @@ def get_queue_index(features, one_hot, namespace, datasets_path, K=16):
         else:
             # 当数量少于 K 时，保留该类别所有的样本，其对应的全局索引即为 global_indices
             # global_mapped = global_indices
-            pad_len = max(0, 16 - global_indices.size(0))
+            pad_len = max(0, K - global_indices.size(0))
             global_mapped = F.pad(global_indices, (0, pad_len), mode='constant', value=-1)
             
         # 根据您的需要，可以将映射后的全局索引保存
@@ -1517,7 +1671,7 @@ def analyze_proto_quality(model, loader, device, go_freq, num_classes):
     
     for protein_feats, labels, indices in loader:
         protein_feats = model.protein_mlp(protein_feats.to(device))  # (B, D)
-        go_feats = model.go_mlp(model.go_embeddings)                 # (C, D)
+        go_feats = model.go_feats                                    # (C, D)
         func_specific = protein_feats.unsqueeze(1) * go_feats.unsqueeze(0)  # (B, C, D)
         prototypes = model._compute_prototypes()                     # (C, D)
         
@@ -1569,11 +1723,11 @@ def analyze_proto_collapse(model, go_freq):
 
 @torch.no_grad()
 def analyze_go_separation(model, go_freq):
-    go_feats = model.go_mlp(model.go_embeddings)  # (C, D)
+    go_feats = model.go_feats  # (C, D)
     go_norm = F.normalize(go_feats, dim=-1)
     sim = go_norm @ go_norm.T  # (C, C)
     
-    for name, (lo, hi) in [("rare", 0, 0.01), ("mid", 0.01, 0.1), ("freq", 0.1, 1)]:
+    for (name, lo, hi) in [("rare", 0, 0.01), ("mid", 0.01, 0.1), ("freq", 0.1, 1)]:
         mask = (go_freq >= lo) & (go_freq < hi)
         idx = mask.nonzero(as_tuple=True)[0]
         if len(idx) > 1:
@@ -1584,3 +1738,102 @@ def analyze_go_separation(model, go_freq):
     rare_mask = go_freq < 0.01
     freq_mask = go_freq >= 0.1
     print(f"rare-freq cross go_sim: {sim[rare_mask][:, freq_mask].mean():.4f}")
+
+@torch.no_grad()
+def diagnose_prototype_failure(model, data_loader, device, go_freq, thresholds=(0.01, 0.05)):
+    """
+    诊断原型模块失效的核心原因：
+    1. 验证哈达玛积后的特征范数 (是否因GO特征坍缩导致乘积后特征消失)
+    2. 验证主网络与动量网络脱节程度 (是否发生严重的原型漂移)
+    
+    参数:
+    thresholds: 用于划分 rare, mid, freq 的频率阈值。请根据你数据集中 n=2450, 100, 24 的真实分界线微调。
+    """
+    model.eval()
+    
+    # 获取单个 Batch 用于验证猜想1
+    protein_feats, _, _ = next(iter(data_loader))
+    protein_feats = protein_feats.to(device)
+    
+    # ---------------------------------------------------------
+    # 猜想 1: 观察哈达玛积后、L2归一化前的特征范数 (L2 Norm)
+    # ---------------------------------------------------------
+    p_feats = model.protein_mlp(protein_feats)
+    g_feats = model.go_feats
+    
+    # 哈达玛积得到的原始特异性特征 (未归一化)
+    func_specific_raw = p_feats.unsqueeze(1) * g_feats.unsqueeze(0)
+    
+    # 计算每个 GO term (dim=1) 在当前 Batch (dim=0) 上的平均 L2 范数
+    norms = torch.norm(func_specific_raw, p=2, dim=-1).mean(dim=0)
+    norms_np = norms.cpu().numpy()
+    
+    # ---------------------------------------------------------
+    # 猜想 2: 主网络 vs 动量网络在 GO 特征映射上的脱节程度
+    # ---------------------------------------------------------
+    main_go = model.go_feats
+    mom_go = model.momentum_go_feats
+    
+    # 计算对应类别的余弦相似度
+    drift_sim = F.cosine_similarity(main_go, mom_go, dim=-1)
+    drift_sim_np = drift_sim.cpu().numpy()
+    
+    # ---------------------------------------------------------
+    # 按频率分桶统计并打印
+    # ---------------------------------------------------------
+    freq_np = go_freq.cpu().numpy()
+    rare_mask = freq_np < thresholds[0]
+    mid_mask  = (freq_np >= thresholds[0]) & (freq_np < thresholds[1])
+    freq_mask = freq_np >= thresholds[1]
+    
+    print("\n" + "="*50)
+    print("原型模块失效诊断报告")
+    print("="*50)
+    
+    print("\n[猜想1验证] 哈达玛积后、归一化前的 L2 范数 (Norm):")
+    print(" --> 如果 Rare 的范数极小(如<0.1)且远小于 Freq，说明 Rare 特征已被哈达玛积抹除，归一化只是在放大噪声。")
+    print(f"  Rare (n={rare_mask.sum():>4}): {norms_np[rare_mask].mean():.6f}")
+    print(f"  Mid  (n={mid_mask.sum():>4}): {norms_np[mid_mask].mean():.6f}")
+    print(f"  Freq (n={freq_mask.sum():>4}): {norms_np[freq_mask].mean():.6f}")
+
+    print("\n[猜想2验证] 主网络与动量网络 GO特征 的余弦相似度:")
+    print(" --> 如果 Rare 的相似度明显低于 Freq (如<0.8)，说明动量更新严重滞后，发生了原型漂移(Drift)。")
+    print(f"  Rare (n={rare_mask.sum():>4}): {drift_sim_np[rare_mask].mean():.4f}")
+    print(f"  Mid  (n={mid_mask.sum():>4}): {drift_sim_np[mid_mask].mean():.4f}")
+    print(f"  Freq (n={freq_mask.sum():>4}): {drift_sim_np[freq_mask].mean():.4f}")
+    print("="*50 + "\n")
+
+
+# ============================================================
+#  类平衡损失：按类别平均，使各类梯度贡献强制 1:1
+# ============================================================
+
+def class_balanced_loss(logits, labels, class_ids, valid_mask):
+    """
+    按类别平均的二分类损失。
+
+    对 batch 中每个被采样的 GO term c：
+      1. 选出 class_ids == c 且 valid_mask == 1 的样本
+      2. 仅取 logits[:, c] 与 labels[:, c] 计算 BCE
+      3. 类内按有效样本数取平均
+    最后对所有类取平均，使各类梯度贡献强制 1:1。
+    """
+    unique_classes = class_ids.unique()
+    losses = []
+
+    for c in unique_classes:
+        c = c.item()
+        mask = (class_ids == c) & (valid_mask > 0.5)
+        n = mask.sum().item()
+        if n == 0:
+            continue
+
+        c_logits = logits[mask, c]          # (n,)
+        c_labels = labels[mask, c]          # (n,)
+        loss_c = F.binary_cross_entropy_with_logits(c_logits, c_labels)
+        losses.append(loss_c)
+
+    if not losses:
+        return torch.tensor(0.0, device=logits.device)
+
+    return torch.stack(losses).mean()
