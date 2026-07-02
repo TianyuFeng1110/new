@@ -456,6 +456,10 @@ def calculate_metrics(ytrue1, ypred1):
 			ytrue.append(ytrue1[i])
 			ypred.append(ypred1[i])	
 
+	# 将 list 转换为 ndarray（仅一次），避免循环内 100 次隐式转换
+	ytrue = np.array(ytrue)
+	ypred = np.array(ypred)
+
 	for t in range(1, 101):
 		thres = t/100.
 
@@ -487,7 +491,7 @@ def calculate_metrics(ytrue1, ypred1):
 
 		fmax=max(fmax, f1)
 
-	return {"Fmax": fmax, "micro_AUPRC": auprc(np.array(ytrue).flatten(), np.array(ypred).flatten())}
+	return {"Fmax": fmax, "micro_AUPRC": auprc(ytrue.flatten(), ypred.flatten())}
 
 # # 写的bug修复版本
 # def auprc_new(ytrue, ypred):
@@ -1365,7 +1369,7 @@ def print_loss_gradients(model, train_loader, parent_indices, child_indices, dev
     print('=' * 60)
 
 
-def eval_func_generalizability(model, test_loader, device, go_freq):
+def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=None):
     print("Starting evaluation...")
 
     # 1. 收集所有预测概率和真实标签
@@ -1379,7 +1383,10 @@ def eval_func_generalizability(model, test_loader, device, go_freq):
             labels = labels.to(device)
             indices = indices.to(device)
 
-            res = model(batch_feats, None, labels)
+            if prototypes is not None:
+                res = model(batch_feats, labels, None, None, prototypes)
+            else:
+                res = model(batch_feats, labels)
             final_probs = res[0]
 
             all_probs.append(final_probs.cpu())
@@ -1837,3 +1844,19 @@ def class_balanced_loss(logits, labels, class_ids, valid_mask):
         return torch.tensor(0.0, device=logits.device)
 
     return torch.stack(losses).mean()
+
+def get_support_query_indices(pos_pools):
+    support = []
+    query = []
+    for c in range(len(pos_pools)):
+        pos_indices = pos_pools[c]
+        if len(pos_indices) >= 2:
+            query_set = set(random.sample(pos_indices, len(pos_indices)//2))
+            support_set = set(pos_indices) - query_set
+            query.append(list(query_set))
+            support.append(list(support_set))
+        else: # 正样本只有一个
+            support.append(pos_indices)
+            query.append([])
+
+    return support, query

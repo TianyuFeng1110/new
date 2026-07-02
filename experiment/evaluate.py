@@ -25,11 +25,13 @@ def get_model(model_type, **kwargs):
         ).to(kwargs['device'])
 
     elif model_type == 2:
-        from models.prototype_model import Model
-        model = Model(
-            input_dim=kwargs['esm_dim'], hidden_dim=kwargs['hidden_dim'], num_classes=kwargs['num_classes'],
-            raw_feats=kwargs['stacked_feats'], go_embeddings=kwargs['go_embeddings'], queue_size=kwargs['queue_size'], queue_indices=kwargs['queue_indices']
-        ).to(kwargs['device'])
+        # from models.prototype_model import Model
+        # model = Model(
+        #     input_dim=kwargs['esm_dim'], hidden_dim=kwargs['hidden_dim'], num_classes=kwargs['num_classes'],
+        #     # raw_feats=kwargs['stacked_feats'],  queue_size=kwargs['queue_size'], queue_indices=kwargs['queue_indices']#, go_embeddings=kwargs['go_embeddings'],
+        # ).to(kwargs['device'])
+        from models.test_model import PrototypeNet
+        model = PrototypeNet(input_dim=kwargs['esm_dim'], hidden_dim=kwargs['hidden_dim'], num_classes=kwargs['num_classes'], go_freq=kwargs['go_freq']).to(kwargs['device'])
 
     return model
 
@@ -51,7 +53,7 @@ def main(args, config):
         case 1:
             checkpoint_path = os.path.join(config['checkpoint_path'], 'custom+prototype', checkpoint)
         case 2:
-            checkpoint_path = os.path.join(config['checkpoint_path'], 'prototype', checkpoint)
+            checkpoint_path = os.path.join(config['checkpoint_path'], 'prototype1', checkpoint)
         case _:
             raise ValueError
     
@@ -94,13 +96,17 @@ def main(args, config):
     # =========================================================
     #                           评估
     # =========================================================
-    # utils.eval_func_generalizability(model, test_loader, device, go_freq)
-    utils.analyze_queue_coverage(model, go_freq)
-    utils.analyze_proto_quality(model, test_loader, device, go_freq, num_classes)
-    utils.analyze_proto_collapse(model, go_freq)
-    utils.analyze_go_separation(model, go_freq)
-    residual_norms = model.class_specific_residual.norm(dim=-1).detach().cpu().numpy()  # (C,)
-    # utils.eval_term_freq_generalizability(model, test_loader, device, go_freq)
+    utils.eval_func_generalizability(model, test_loader, device, go_freq)
+    utils.eval_term_freq_generalizability(model, test_loader, device, go_freq)
+    # utils.analyze_queue_coverage(model, go_freq)
+    # print('对每个类分别统计：正样本与原型、负样本与原型的余弦相似度分布: ')
+    # utils.analyze_proto_quality(model, test_loader, device, go_freq, num_classes)
+    # print('计算原型之间的两两余弦相似度，检查是否坍缩(prototypes = F.normalize(model._compute_prototypes(), p=2, dim=-1))')
+    # utils.analyze_proto_collapse(model, go_freq)
+    # print('计算go feats的分离度(和余弦相似度)')
+    # utils.analyze_go_separation(model, go_freq)
+    # utils.diagnose_prototype_failure(model, test_loader, device, go_freq, thresholds=(0.01, 0.05))
+    # # utils.eval_term_freq_generalizability(model, test_loader, device, go_freq)
     # =========================================================
     pass
 

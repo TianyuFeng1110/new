@@ -6,8 +6,8 @@ import torch.optim as optim
 import numpy as np
 
 from ruamel.yaml import YAML
-from models.prototype_model import PrototypeNet
-from datasets.balanced_dataset import Dataset
+from models.test_model import PrototypeNet
+from datasets.balanced_dataset import Dataset  # 保持索引对齐（不过滤空标签）
 from datasets.prototype_valid_collator import collator
 from datasets.prototype_sampler import PrototypeSampler
 from datasets.prototype_collator import PrototypeCollator
@@ -148,7 +148,7 @@ def main(args, config):
             'epoch': epoch,
         }
         os.makedirs("/archive/hot5/fty/checkpoints/TALE/prototype1", exist_ok=True)
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype", 'checkpoint_%02d.pth' % epoch))
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype1", 'checkpoint_%02d.pth' % epoch))
         if epoch % 10 == 0:
             utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes)
 

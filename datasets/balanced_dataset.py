@@ -4,9 +4,10 @@ import random
 from unittest import result
 import torch
 from torch.utils.data import Dataset
+import numpy as np
 
 class Dataset(Dataset):
-    def __init__(self, dataset_path, namespace, train_mode, dataset_mode, val_ratio=0.1):
+    def __init__(self, dataset_path, namespace, train_mode, dataset_mode, val_ratio=0.1, valid_mask=None):
 
         assert 0 <= val_ratio < 1, "val_ratio must be between 0 and 1"
 
@@ -29,6 +30,7 @@ class Dataset(Dataset):
             (i, seqs[i]['seq'], labels[i]) if len(labels[i])!=0 else (i, seqs[i]['seq'], [0]) # # 蛋白质数据集中有几条数据未标注namespace根节点功能(CC中是3条)
             for i in range(len(seqs)) 
         ]
+        if valid_mask is not None: data = self.update_labels_numpy(valid_mask, data) # 去除无效标签，并更新标签索引
 
         # 从训练集中随机划分验证集
         if train_mode == 'train':
@@ -73,3 +75,24 @@ class Dataset(Dataset):
                 result[val].append(idx)
                 
         return result
+    
+    def update_labels_numpy(self, valid_mask, data):
+        # 将 valid_mask 转换为布尔类型的 numpy 数组
+        mask = np.array(valid_mask, dtype=bool)
+        
+        # 1. 计算前缀和：计算到当前位置为止，有多少个 True
+        # 例如：[True, True, False, True] -> [1, 2, 2, 3]
+        # 减去 1 转换为 0 开始的索引 -> [0, 1, 1, 2]
+        mapping = np.cumsum(mask) - 1
+        
+        new_data = []
+        for row_idx, data_str, label_list in data:
+            new_label_list = []
+            for label in label_list:
+                # 确保标签在 valid_mask 范围内，且该标签本身没有被 mask 掉
+                if label < len(mask) and mask[label]:
+                    # 通过映射表直接获取新索引
+                    new_label_list.append(int(mapping[label]))
+            new_data.append((row_idx, data_str, new_label_list))
+            
+        return new_data

@@ -33,7 +33,7 @@ def valid(model, loader, epoch, device):
     diag_accum = {}  # 累积所有 batch 的诊断统计
     for batch_idx, (inputs, labels, mask) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
 
-        logits, tau, bias = model(inputs.to(device), labels.to(device))
+        probs, logits, _ = model(inputs.to(device), labels.to(device))
         final_probs = torch.sigmoid(logits)
         total_loss = F.binary_cross_entropy_with_logits(logits, labels.to(device))
 
@@ -41,12 +41,12 @@ def valid(model, loader, epoch, device):
         all_labels.append(labels.detach().cpu())
         metric_logger.update(total_loss=total_loss.item())
         metric_logger.update(proto_loss=total_loss.item())
-        metric_logger.update(tau_max=tau.max())
-        metric_logger.update(tau_min=tau.min())
-        metric_logger.update(tau_mean=tau.mean())
-        metric_logger.update(bias_max=bias.max())
-        metric_logger.update(bias_min=bias.min())
-        metric_logger.update(bias_mean=bias.mean())
+        metric_logger.update(tau_max=0)
+        metric_logger.update(tau_min=0)
+        metric_logger.update(tau_mean=0)
+        metric_logger.update(bias_max=0)
+        metric_logger.update(bias_min=0)
+        metric_logger.update(bias_mean=0)
 
     # target_freq = torch.exp(torch.tensor(model.gate_c.item())) - 1e-6 # sigma=0.5时 log_freq=gate_c, 逆对数得原始频率
     # target_freq = torch.clamp(target_freq, min=0.0)
@@ -76,24 +76,24 @@ def train(model, optimizer, loader, epoch, device, balanced_N, balanced_k):
     for batch_idx, (inputs, labels, mask) in enumerate(metric_logger.log_every(loader, print_freq=1, header=header)):
         optimizer.zero_grad(set_to_none=True)
 
-        logits, tau, bias = model(inputs.to(device), labels.to(device))
+        probs, logits, _ = model(inputs.to(device), labels.to(device))
         total_loss = utils.balanced_bce_loss(logits, labels.to(device), mask, balanced_N, balanced_k)
         # total_loss = utils.balanced_asl_loss(logits, labels.to(device), mask, balanced_N, balanced_k)
 
         total_loss.backward()
         optimizer.step()
-        model._momentum_update()
+        # model._momentum_update()
         
         metric_logger.update(lr=optimizer.param_groups[-1]["lr"])  
         metric_logger.update(total_loss=total_loss.item())
         metric_logger.update(proto_loss=total_loss.item())
         metric_logger.update(cb_loss=total_loss.item())
-        metric_logger.update(tau_max=tau.max())
-        metric_logger.update(tau_min=tau.min())
-        metric_logger.update(tau_mean=tau.mean())
-        metric_logger.update(bias_max=bias.max())
-        metric_logger.update(bias_min=bias.min())
-        metric_logger.update(bias_mean=bias.mean())
+        metric_logger.update(tau_max=0)
+        metric_logger.update(tau_min=0)
+        metric_logger.update(tau_mean=0)
+        metric_logger.update(bias_max=0)
+        metric_logger.update(bias_min=0)
+        metric_logger.update(bias_mean=0)
         
     print("Averaged stats: {}".format(metric_logger.global_avg()))
 
@@ -159,7 +159,7 @@ def main(args, config):
     
     model = Model(
         input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes,
-           raw_feats=stacked_feats, queue_size=queue_size, queue_indices=queue_indices
+        #    raw_feats=stacked_feats, queue_size=queue_size, queue_indices=queue_indices
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=base_lr)  
@@ -183,7 +183,7 @@ def main(args, config):
                     'config': config,
                     'epoch': epoch,
                 }
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype", 'checkpoint_%02d.pth'%epoch))  
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype1", 'checkpoint_%02d.pth'%epoch))  
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')
@@ -191,7 +191,7 @@ if __name__ == "__main__" :
     parser.add_argument('--config', type=str, default='./config/cc.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--batch_size', type=int, default=256, help='batch size') # CC:32, BP:4, MF:14
-    parser.add_argument('--epochs', type=int, default=50, help='epoch')
+    parser.add_argument('--epochs', type=int, default=100, help='epoch')
     parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
     parser.add_argument('--result_path', type=str, default="/archive/hot3/fty/result/", help='result save path')
     parser.add_argument('--mode', type=str, default='test', help='[train/test]')

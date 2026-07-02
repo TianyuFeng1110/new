@@ -24,7 +24,7 @@ class Dataset(Dataset):
         # self.data: list of (idx, sequence, label_indices)
         data = [
             (i, seqs[i]['seq'], labels[i])
-            for i in range(len(seqs))
+            for i in range(len(seqs)) if len(labels[i])!=0
         ]
 
         # 从训练集中随机划分验证集
