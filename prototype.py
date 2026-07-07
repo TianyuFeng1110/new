@@ -13,8 +13,7 @@ from datasets.prototype_sampler import PrototypeSampler
 from datasets.prototype_collator import PrototypeCollator
 from torch.utils.data import DataLoader, SequentialSampler
 
-
-def train(model, optimizer, loader, epoch, device):
+def train(model, optimizer, loader, epoch, parent_indices, child_indices, device):
     """原型网络训练：每 batch 采样 n_way 个 GO term，support 计算原型，query 计算距离 → BCE loss。"""
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -27,7 +26,6 @@ def train(model, optimizer, loader, epoch, device):
         optimizer.zero_grad(set_to_none=True)
 
         logits, loss, temp = model(query=inputs_feats.to(device), labels=labels.to(device), support=support_feats.to(device), support_indices=support_indices.to(device))
-
         loss.backward()
         optimizer.step()
 
@@ -62,8 +60,10 @@ def valid(model, prototypes, valid_loader, epoch, device):
     all_probs = torch.cat(all_probs, dim=0).numpy()
     all_labels = torch.cat(all_labels, dim=0).numpy()
     metric = utils.calculate_metrics(all_labels, all_probs)
-    print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(
-        metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
+    macro_aupr = utils.macro_auprc(all_labels, all_probs)
+    # print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(
+    #     metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
+    print("Averaged stats: {}, macro aupr: {:.4f}".format(metric_logger.global_avg(), macro_aupr))
 
     return all_probs, all_labels
 
@@ -100,6 +100,15 @@ def main(args, config):
     all_feats = torch.stack([protein_feats[k] for k in indices], dim=0).to(device)
     _, proto_idx_mask = utils.get_prototype_index_tensor(train_seq_data)
     go_freq = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))[valid_mask]
+    _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
+    # ---- valid_mask 过滤后需重映射层次边索引 ----
+    old2new = torch.full((len(valid_mask),), -1, dtype=torch.long)
+    old2new[valid_mask] = torch.arange(num_classes)
+    edge_parents = torch.from_numpy(_edges[:, 0].copy()).long()
+    edge_children = torch.from_numpy(_edges[:, 1].copy()).long()
+    keep = (old2new[edge_parents] >= 0) & (old2new[edge_children] >= 0)
+    parent_indices = old2new[edge_parents[keep]].to(device)
+    child_indices = old2new[edge_children[keep]].to(device)
 
     utils.set_random_seed(seed)
 
@@ -113,14 +122,14 @@ def main(args, config):
         protein_feats=protein_feats, n_way=n_way, support=support, sampler=train_sampler,
         n_query=n_query, n_support=n_support, num_classes=num_classes)
     train_loader = DataLoader(
-        raw_dataset, batch_sampler=train_sampler, collate_fn=train_collator, num_workers=0)
+        raw_dataset, batch_sampler=train_sampler, collate_fn=train_collator, num_workers=2)
 
     # ---- 验证 DataLoader：全类预测 ----
     valid_dataset = Dataset(datasets_path, namespace, train_mode=mode, dataset_mode='test', valid_mask=valid_mask)
     test_collator = collator(num_classes, test_protein_feats)
     valid_loader = DataLoader(
         valid_dataset, batch_size=n_query*n_way, shuffle=False,
-        sampler=SequentialSampler(valid_dataset), drop_last=False, num_workers=0,
+        sampler=SequentialSampler(valid_dataset), drop_last=False, num_workers=2,
         collate_fn=test_collator,
         worker_init_fn=utils.seed_worker)
 
@@ -131,9 +140,10 @@ def main(args, config):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
     print('start training......')
+
     for epoch in range(epochs):
         # 训练
-        train(model, optimizer, train_loader, epoch, device)
+        train(model, optimizer, train_loader, epoch, parent_indices, child_indices, device)
         scheduler.step()
 
         # 验证
@@ -149,8 +159,9 @@ def main(args, config):
         }
         os.makedirs("/archive/hot5/fty/checkpoints/TALE/prototype1", exist_ok=True)
         torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype", 'checkpoint_%02d.pth' % epoch))
-        if epoch % 10 == 0:
-            utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes)
+        utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes)
+        if epoch % 9 == 0:
+            utils.eval_term_freq_generalizability(model, valid_loader, device, go_freq, prototypes=prototypes)
 
 
 if __name__ == "__main__":

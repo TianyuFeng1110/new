@@ -442,6 +442,23 @@ def auprc(ytrue, ypred):
   #print (r, len(r), p, t)
   return auc(r,p)
 
+def macro_auprc(ytrue1, ypred1):
+    """
+    计算 Macro AUPRC（按类别平均的 AUPR，仅考虑在测试集中至少有一个正样本的类别）。
+
+    :param ytrue1:    ndarray, shape (n_samples, n_classes), multi-hot 编码的真实标签
+    :param ypred1:    ndarray, shape (n_samples, n_classes), 模型预测概率或 logits
+    :return:          float, Macro AUPRC 值
+    """
+
+    # 只保留在测试集中至少有一个正样本的类别（全零列无法计算 AUPR）
+    mask = ytrue1.sum(axis=0) > 0
+    ytrue_mask = ytrue1[:, mask]
+    ypred_mask = ypred1[:, mask]
+
+    return average_precision_score(ytrue_mask, ypred_mask, average='macro')
+
+
 def calculate_metrics(ytrue1, ypred1):
 
 	fmax = 0
@@ -1386,7 +1403,8 @@ def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=N
             if prototypes is not None:
                 res = model(batch_feats, labels, None, None, prototypes)
             else:
-                res = model(batch_feats, labels)
+                # res = model(batch_feats, labels)
+                res = model(batch_feats, indices, labels)
             final_probs = res[0]
 
             all_probs.append(final_probs.cpu())
@@ -1438,7 +1456,7 @@ def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=N
           f"micro_AUPRC={metrics_all['micro_AUPRC']:.4f}")
 
 
-def eval_term_freq_generalizability(model, test_loader, device, go_freq):
+def eval_term_freq_generalizability(model, test_loader, device, go_freq, prototypes=None):
     """按 GO term 自身的功能频率划分频率桶，评估模型在不同频率桶上的泛化能力。
 
     与 eval_func_generalizability 的区别：
@@ -1466,7 +1484,10 @@ def eval_term_freq_generalizability(model, test_loader, device, go_freq):
             labels = labels.to(device)
             indices = indices.to(device)
 
-            res = model(batch_feats, indices, labels)
+            if prototypes != None:
+                res = model(query=batch_feats, labels=labels, prototypes=prototypes)
+            else:
+                res = model(batch_feats, indices, labels)
             final_probs = res[0]
 
             all_probs.append(final_probs.cpu())
@@ -1860,3 +1881,46 @@ def get_support_query_indices(pos_pools):
             query.append([])
 
     return support, query
+
+def load_npy_file(file_path):
+    numpy_array = np.load(file_path)
+    tensor_data = torch.from_numpy(numpy_array).float()
+    return tensor_data
+
+def test_gradient_ratio(model, query, labels, support, support_indices, parent_indices, child_indices, device):
+    """用于评估hier loss和分类loss的梯度范数比值，帮助调节权重。
+    测试两个 loss 的梯度范数比值，用于调权重。
+
+    分别做两次独立前向+反向传播，记录梯度总范数，
+    打印比值 hier_grad_norm / bce_grad_norm。
+    目标：让比值接近 1.0。
+    """
+    model.train()
+    q = query.to(device)
+    lb = labels.to(device)
+    s = support.to(device)
+    si = support_indices.to(device)
+
+    # ---- 1. BCE loss 梯度 ----
+    model.zero_grad(set_to_none=True)
+    logits1, bce_loss, _ = model(query=q, labels=lb, support=s, support_indices=si)
+    bce_loss.backward()
+    bce_grad_norm = sum(
+        p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+
+    # ---- 2. Hier loss 梯度 ----
+    model.zero_grad(set_to_none=True)
+    logits2, _, _ = model(query=q, labels=lb, support=s, support_indices=si)
+    hier_loss = compute_hier_loss(logits2, parent_indices, child_indices)
+    hier_loss.backward()
+    hier_grad_norm = sum(
+        p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+
+    ratio = hier_grad_norm / (bce_grad_norm + 1e-8)
+
+    print(f"[Gradient Ratio Test] "
+          f"BCE grad norm={bce_grad_norm:.4f}, "
+          f"Hier grad norm={hier_grad_norm:.4f}, "
+          f"ratio (hier/bce)={ratio:.4f}")
+
+    return bce_grad_norm, hier_grad_norm, ratio
