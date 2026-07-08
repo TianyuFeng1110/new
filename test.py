@@ -82,6 +82,9 @@ def main(args, config):
     n_way = config.get('n_way', 32)
     n_query = config.get('n_query', 4)
     n_support = config.get('n_support', 50)
+    lambda_ = config.get('lambda')
+    alpha_ = config.get('alpha')
+    print('超参数alpha:', alpha_, 'lambda:', lambda_)
     features_path = '/archive/hot5/fty/TALE/'
     protein_feats = torch.load(
         os.path.join(features_path, 'protein_feats', f'train_{namespace.lower()}_protein_feats.pt'),
@@ -99,9 +102,17 @@ def main(args, config):
     indices = sorted(protein_feats.keys(), key=int)
     all_feats = torch.stack([protein_feats[k] for k in indices], dim=0).to(device)
     _, proto_idx_mask = utils.get_prototype_index_tensor(train_seq_data)
-    go_freq = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))[valid_mask]
+    go_freq, class_counts = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))
+    go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
     adj_matrix = utils.load_npy_file(os.path.join(datasets_path, f"{namespace.lower()}_adj_matrix.npy"))
     adj_matrix = adj_matrix[valid_mask][:, valid_mask]
+    go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
+    parents_matrix, childs_matrix = utils.get_go_adjacency_matrices(go2id)
+    parents_matrix = parents_matrix[valid_mask][:, valid_mask]
+    _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
+    hop_counts = utils.get_ancestor_hop_matrix(_edges) # 每个节点到任意祖先节点的跳数
+    hop_counts = hop_counts[valid_mask][:, valid_mask]
+    proto_w = utils.compute_ancestor_weights(hop_counts, class_counts, lambda_)
     # ---- valid_mask 过滤后需重映射层次边索引 ----
     # _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
     # old2new = torch.full((len(valid_mask),), -1, dtype=torch.long)
@@ -136,7 +147,7 @@ def main(args, config):
         worker_init_fn=utils.seed_worker)
 
     # ---- 模型 ----
-    model = PrototypeNet(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes, frequency=go_freq, adj_matrix=adj_matrix).to(device)
+    model = PrototypeNet(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes, frequency=go_freq, parents_matrix=parents_matrix, class_counts=class_counts, proto_w=proto_w, smooth_tau=alpha_).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=base_lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)

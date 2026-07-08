@@ -1,6 +1,6 @@
 hidden_dim: 1024
 esm_dim: 640
-base_lr: 1e-3
+base_lr: 4e-3
 
 num_classes: 2574             # TALE cc:2574, CAFA3 cc:2434
 
@@ -8,3 +8,6 @@ num_classes: 2574             # TALE cc:2574, CAFA3 cc:2434
 n_way: 32                     # 每 batch 采样的 GO term 数
 n_query: 4                    # 每个 GO term 的查询蛋白质数
 n_support: 10                  # 每个 GO term 的支持蛋白质数（用于计算原型）
+
+alpha: 10                     # 用来控制子节点原型的比例
+lambda: 100                   # 用来控制稳定祖先节点原型样本量权重

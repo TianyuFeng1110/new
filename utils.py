@@ -1111,8 +1111,8 @@ def compute_go_term_frequency(mask, num_proteins):
     '''获取每个go term的频率
        该go term注释到的蛋白质占训练集中总蛋白质的数量
     '''
-    
-    return mask.sum(dim=1).float() / num_proteins
+    class_counts = mask.sum(dim=1).float()
+    return class_counts / num_proteins, class_counts
 
 def compute_protein_alf(protein_labels, go_frequencies):
     '''获取蛋白质的ALF'''
@@ -1924,3 +1924,141 @@ def test_gradient_ratio(model, query, labels, support, support_indices, parent_i
           f"ratio (hier/bce)={ratio:.4f}")
 
     return bce_grad_norm, hier_grad_norm, ratio
+
+import numpy as np
+
+def get_go_adjacency_matrices(go_dict):
+    """
+    根据输入的 GO 关系字典，构建直接父节点邻接矩阵和直接子节点邻接矩阵。
+    
+    参数:
+    go_dict (dict): 格式为 { GO_ID: {'father': [...], 'child': [...], 'ind': int} }
+    
+    返回:
+    father_matrix (np.ndarray): 父节点邻接矩阵 (N x N)
+    child_matrix (np.ndarray): 子节点邻接矩阵 (N x N)
+    """
+    if not go_dict:
+        return np.array([]), np.array([])
+        
+    # 1. 建立 GO ID 到 索引(ind) 的映射关系，并确定矩阵的大小 N
+    go_to_ind = {}
+    max_ind = -1
+    for go_id, info in go_dict.items():
+        ind = info['ind']
+        go_to_ind[go_id] = ind
+        if ind > max_ind:
+            max_ind = ind
+            
+    N = max_ind + 1  # 矩阵的大小由最大索引决定
+    
+    # 2. 初始化邻接矩阵（全零矩阵）
+    father_matrix = np.zeros((N, N), dtype=int)
+    child_matrix = np.zeros((N, N), dtype=int)
+    
+    # 3. 填充邻接矩阵
+    for go_id, info in go_dict.items():
+        current_ind = info['ind']
+        
+        # 填充父节点关系
+        # 若当前节点 i 的直接父亲是节点 j，则 father_matrix[i][j] = 1
+        for father_id in info.get('father', []):
+            if father_id in go_to_ind:  # 确保父亲节点在当前字典中存在
+                father_ind = go_to_ind[father_id]
+                father_matrix[current_ind][father_ind] = 1
+                
+        # 填充子节点关系
+        # 若当前节点 i 的直接孩子是节点 j，则 child_matrix[i][j] = 1
+        for child_id in info.get('child', []):
+            if child_id in go_to_ind:   # 确保子节点在当前字典中存在
+                child_ind = go_to_ind[child_id]
+                child_matrix[current_ind][child_ind] = 1
+                
+    return father_matrix, child_matrix
+
+def get_ancestor_hop_matrix(edges: np.ndarray) -> torch.Tensor:
+    """计算每个节点到其祖先节点的最短跳数矩阵。
+
+    Args:
+        edges (np.ndarray): 形状为 (num_edges, 2) 的数组，每行为 [parent_index,
+          child_index]。
+
+    Returns:
+        torch.Tensor: 形状为 (num_nodes, num_nodes) 的张量。
+                      matrix[i, j] 表示节点 i 到其祖先节点 j
+                      的最短跳数。如果无祖先关系，则为 0。
+    """
+    if edges.size == 0:
+        return torch.empty((0, 0), dtype=torch.long)
+
+    # 1. 确定节点总数（假设节点索引为 0 到 max_idx）
+    num_nodes = int(edges.max()) + 1
+
+    # 2. 构建逆向邻接表（从子节点指向其所有直接父节点）
+    parent_dict = {i: [] for i in range(num_nodes)}
+    for parent, child in edges:
+        parent_dict[int(child)].append(int(parent))
+
+    # 3. 初始化跳数矩阵，默认值为 0（表示不可达或无祖先关系）
+    hop_matrix = torch.zeros((num_nodes, num_nodes), dtype=torch.long)
+
+    # 4. 对每个节点执行 BFS，计算到其所有祖先节点的最短距离
+    for start_node in range(num_nodes):
+        queue = deque([(start_node, 0)])
+        visited = {start_node}  # 避免重复访问
+
+        while queue:
+            curr_node, dist = queue.popleft()
+
+            for parent in parent_dict[curr_node]:
+                if parent not in visited:
+                    visited.add(parent)
+                    next_dist = dist + 1
+                    # 记录起点到该祖先节点的最短跳数
+                    hop_matrix[start_node, parent] = next_dist
+                    queue.append((parent, next_dist))
+
+    return hop_matrix
+
+
+def compute_ancestor_weights(hop_counts: torch.Tensor, class_counts: torch.Tensor, lambda_: float) -> torch.Tensor:
+    """计算每个 GO term 节点对其所有祖先节点的参考权重矩阵。
+
+    权重公式: γ * n / (n + λ)
+
+    - γ = 1 / d：距离衰退系数，d 为节点 i 到祖先 j 的最短跳数。
+      距离越近的祖先语义越相关，γ 越大，权重越高。
+    - n = class_counts[j]：祖先节点 j 注释到的蛋白质样本数量。
+      样本量越大的祖先越可靠，权重越高。
+    - λ：超参数，控制样本量对权重的影响程度。
+      λ 越大，样本量差异对权重的影响越小。
+
+    Args:
+        hop_counts:  形状 (num_nodes, num_nodes)。
+                     hop_counts[i][j] > 0 表示 j 是 i 的祖先，值为最短跳数 d；
+                     hop_counts[i][j] == 0 表示 j 不是 i 的祖先。
+        class_counts: 形状 (num_nodes,)，每个 GO term 注释到的蛋白质样本数量 n。
+        lambda_:     超参数 λ，调节样本数量的影响。
+
+    Returns:
+        weight: 形状 (num_nodes, num_nodes)。
+                weight[i][j] 表示节点 i 对其祖先节点 j 的参考权重。
+                若 j 不是 i 的祖先，weight[i][j] = 0。
+
+    Example:
+        >>> # 节点 0 的祖先: 节点 2 (跳数 1, 样本数 100), 节点 3 (跳数 3, 样本数 10)
+        >>> # weight[0][2] = (1/1) * 100/(100+λ)
+        >>> # weight[0][3] = (1/3) * 10/(10+λ)
+    """
+    ancestor_mask = hop_counts > 0
+
+    # γ = 1 / d，非祖先位置自动为 0
+    gamma = torch.where(ancestor_mask, 1.0 / hop_counts.float(), torch.tensor(0.0))
+
+    # n / (n + λ)，样本量缩放因子（广播到所有行）
+    n = class_counts.float()
+    sample_factor = n / (n + lambda_)
+
+    weight = gamma * sample_factor.unsqueeze(0)
+
+    return weight
