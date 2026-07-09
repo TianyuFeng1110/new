@@ -15,10 +15,14 @@ from timm.loss import AsymmetricLossMultiLabel
 
 class PrototypeNet(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, num_classes, frequency, dropout=0.4):
+    def __init__(self, input_dim, hidden_dim, num_classes, frequency,  parents_matrix, class_counts, proto_w, dropout=0.4, smooth_tau=30):
         super().__init__()
 
-        #self.residue_proj = nn.Linear(input_dim, hidden_dim)
+        self.register_buffer('parents_matrix', torch.as_tensor(parents_matrix, dtype=torch.float32))
+        self.register_buffer('frequency', frequency.float())
+        self.register_buffer('class_counts', class_counts.float())
+        self.register_buffer('smooth_tau', torch.tensor(smooth_tau, dtype=torch.float32))
+        self.register_buffer('proto_w', torch.as_tensor(proto_w, dtype=torch.float32))
 
         self.mlp = nn.Sequential(
             nn.LayerNorm(input_dim),
@@ -30,13 +34,6 @@ class PrototypeNet(nn.Module):
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        self.relation = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
         )
 
         self.temperature = nn.Parameter(torch.ones(num_classes) * 2.0)
@@ -51,12 +48,13 @@ class PrototypeNet(nn.Module):
 
     def forward(self, query, labels, support=None, support_indices=None, prototypes=None): # query的数量是固定的，不足的是有放回的
         
-        q_feats = self.mlp(query)# + self.residue_proj(query)         # (num_queries, hidden_dim)
+        q_feats = self.mlp(query)         # (num_queries, hidden_dim)
 
         if self.training:
-            s_feats = self.mlp(support)# + self.residue_proj(support)         # (num_support, hidden_dim)
+            s_feats = self.mlp(support)       # (num_support, hidden_dim)
             gathered = s_feats[support_indices]        # (num_class, support_num, hidden_dim)
             proto_feats = gathered.mean(dim=1)           # (num_class, hidden_dim)
+            proto_feats = self._smooth_prototypes(proto_feats)
             logits = self.predict(q_feats, proto_feats)  # (num_queries, num_class)
         else:
              logits = self.predict(q_feats, prototypes) 
@@ -64,47 +62,47 @@ class PrototypeNet(nn.Module):
 
         return logits, loss, self.temperature.mean()
     
-    # def predict(self, query_emb, prototypes):
-    #     q = F.normalize(query_emb, p=2, dim=1)      # 单位球面上
-    #     p = F.normalize(prototypes, p=2, dim=1)
-    #     cos_sim = q @ p.T                           # 范围 [-1, 1]
-    #     temp = F.softplus(self.temperature) + 1e-5 
-    #     return temp * cos_sim + self.bias          # 可学习的 temperature
-    
-    def predict(self, query_emb, prototypes, class_indices=None):
+    def _smooth_prototypes(self, self_proto):
+        """频率加权平滑：w * 自身原型 + (1 - w) * 最优祖先原型。
+
+        最优祖先 = proto_w 中权重最大的祖先节点，其原型代替父节点原型。
+        罕见功能（正样本少）更多依赖稳定祖先原型(稳定权重由 proto_w 给出)；根节点（无祖先）回退为自身原型。
+
+        Args:
+            self_proto: (num_classes, hidden_dim) 纯均值原型
+        Returns:
+            (num_classes, hidden_dim) 平滑后的原型
         """
-        query_emb:   (B, D)
-        prototypes:  (C, D)
-        class_indices: (C,) 可选, 仅在训练时用于索引 temperature/bias
-        """
-        B, D = query_emb.shape
-        C = prototypes.shape[0]
-        
-        # 扩展维度以计算所有 query-prototype 对
-        q = query_emb.unsqueeze(1).expand(B, C, D)       # (B, C, D)
-        p = prototypes.unsqueeze(0).expand(B, C, D)       # (B, C, D)
-        
-        # Relation Net: 拼接 [query, proto, query*proto (交互项)]
-        relation_input = torch.cat([q, p, q * p], dim=-1)  # (B, C, 3D)
-        scores = self.relation(relation_input).squeeze(-1)  # (B, C)
-        
-        # 温度缩放 + bias
-        if class_indices is not None:
-            temp = F.softplus(self.temperature[class_indices]) + 1e-5
-            bias = self.bias[class_indices]
-        else:
-            temp = F.softplus(self.temperature) + 1e-5
-            bias = self.bias
-        
-        return temp * scores + bias
+        if self.parents_matrix is None:
+            return self_proto
+
+        # proto_w: (num_classes, num_classes)，proto_w[i][j] 是节点 i 对祖先 j 的权重
+        # 每行取权重最大的祖先索引；无祖先的行 argmax 会返回 0，后续用 mask 屏蔽
+        best_ancestor = self.proto_w.argmax(dim=1)                 # (num_classes,)
+        has_ancestor = self.proto_w.sum(dim=1) > 0                 # (num_classes,)
+        stable_ancestor_proto = self_proto[best_ancestor]                   # (num_classes, hidden_dim)
+
+        # 无祖先的根节点：父原型回退为自身原型
+        stable_ancestor_proto[~has_ancestor] = self_proto[~has_ancestor]
+
+        w = (self.class_counts / (self.class_counts + self.smooth_tau)).unsqueeze(1)                   # (num_classes, 1)
+        return w * self_proto + (1.0 - w) * stable_ancestor_proto
+
+    def predict(self, query_emb, prototypes):
+        q = F.normalize(query_emb, p=2, dim=1)      # 单位球面上
+        p = F.normalize(prototypes, p=2, dim=1)
+        cos_sim = q @ p.T                           # 范围 [-1, 1]
+        temp = F.softplus(self.temperature) + 1e-5 
+        return temp * cos_sim + self.bias          # 可学习的 temperature
     
     @ torch.no_grad()
     def _get_prototypes(self, all_feats, prototype_index):
         self.eval()
 
-        s_feats = self.mlp(all_feats)# + self.residue_proj(all_feats)         # (B, D)
+        s_feats = self.mlp(all_feats)         # (B, D)
         proto_mask = prototype_index.float()               # (B, C)
         proto_feats = proto_mask.T @ s_feats               # (C, D): 每个类累加其所有正样本蛋白质的嵌入
         class_counts = proto_mask.sum(dim=0).clamp(min=1)  # (C,):  每个类的正样本数
         proto_feats = proto_feats / class_counts.unsqueeze(1)  # (C, D): 均值 → 原型
+        proto_feats = self._smooth_prototypes(proto_feats)
         return proto_feats

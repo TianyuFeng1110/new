@@ -13,7 +13,7 @@ from datasets.prototype_sampler import PrototypeSampler
 from datasets.prototype_collator import PrototypeCollator
 from torch.utils.data import DataLoader, SequentialSampler
 
-def train(model, optimizer, loader, epoch, parent_indices, child_indices, device):
+def train(model, optimizer, loader, epoch, device):
     """原型网络训练：每 batch 采样 n_way 个 GO term，support 计算原型，query 计算距离 → BCE loss。"""
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -82,6 +82,10 @@ def main(args, config):
     n_way = config.get('n_way', 32)
     n_query = config.get('n_query', 4)
     n_support = config.get('n_support', 50)
+    lambda_ = config.get('lambda')
+    alpha_ = config.get('alpha')
+    beta_ = config.get('beta')
+    print('超参数alpha:', alpha_, 'lambda:', lambda_, 'beta:', beta_)
     features_path = '/archive/hot5/fty/TALE/'
     protein_feats = torch.load(
         os.path.join(features_path, 'protein_feats', f'train_{namespace.lower()}_protein_feats.pt'),
@@ -99,16 +103,29 @@ def main(args, config):
     indices = sorted(protein_feats.keys(), key=int)
     all_feats = torch.stack([protein_feats[k] for k in indices], dim=0).to(device)
     _, proto_idx_mask = utils.get_prototype_index_tensor(train_seq_data)
-    go_freq = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))[valid_mask]
+    go_freq, class_counts = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))
+    go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
+    adj_matrix = utils.load_npy_file(os.path.join(datasets_path, f"{namespace.lower()}_adj_matrix.npy"))
+    adj_matrix = adj_matrix[valid_mask][:, valid_mask]
+    go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
+    parents_matrix, childs_matrix = utils.get_go_adjacency_matrices(go2id)
+    parents_matrix = parents_matrix[valid_mask][:, valid_mask]
     _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
+    hop_counts = utils.get_ancestor_hop_matrix(_edges) # 每个节点到任意祖先节点的跳数
+    hop_counts = hop_counts[valid_mask][:, valid_mask]
+    # proto_w = utils.compute_ancestor_weights(hop_counts, class_counts, lambda_)
+    obo_path = os.path.join(datasets_path, 'go-basic.obo')
+    ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
+    proto_w = utils.compute_ancestor_weights_ic(hop_counts, ic, class_counts, lambda_, beta_)
     # ---- valid_mask 过滤后需重映射层次边索引 ----
-    old2new = torch.full((len(valid_mask),), -1, dtype=torch.long)
-    old2new[valid_mask] = torch.arange(num_classes)
-    edge_parents = torch.from_numpy(_edges[:, 0].copy()).long()
-    edge_children = torch.from_numpy(_edges[:, 1].copy()).long()
-    keep = (old2new[edge_parents] >= 0) & (old2new[edge_children] >= 0)
-    parent_indices = old2new[edge_parents[keep]].to(device)
-    child_indices = old2new[edge_children[keep]].to(device)
+    # _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
+    # old2new = torch.full((len(valid_mask),), -1, dtype=torch.long)
+    # old2new[valid_mask] = torch.arange(num_classes)
+    # edge_parents = torch.from_numpy(_edges[:, 0].copy()).long()
+    # edge_children = torch.from_numpy(_edges[:, 1].copy()).long()
+    # keep = (old2new[edge_parents] >= 0) & (old2new[edge_children] >= 0)
+    # parent_indices = old2new[edge_parents[keep]].to(device)
+    # child_indices = old2new[edge_children[keep]].to(device)
 
     utils.set_random_seed(seed)
 
@@ -134,7 +151,7 @@ def main(args, config):
         worker_init_fn=utils.seed_worker)
 
     # ---- 模型 ----
-    model = PrototypeNet(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes, frequency=go_freq).to(device)
+    model = PrototypeNet(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes, frequency=go_freq, parents_matrix=parents_matrix, class_counts=class_counts, proto_w=proto_w, smooth_tau=alpha_).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=base_lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
@@ -143,7 +160,7 @@ def main(args, config):
 
     for epoch in range(epochs):
         # 训练
-        train(model, optimizer, train_loader, epoch, parent_indices, child_indices, device)
+        train(model, optimizer, train_loader, epoch, device)
         scheduler.step()
 
         # 验证
@@ -167,7 +184,7 @@ def main(args, config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Prototypical Network for Protein Function Prediction')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--config', type=str, default='./config/cc.yml')
+    parser.add_argument('--config', type=str, default='./config/config.yml')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--path', type=str, default="./data_tale/TALE/")
