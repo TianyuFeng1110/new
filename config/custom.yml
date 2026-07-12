@@ -1,7 +1,7 @@
 hidden_dim: 1024
 esm_dim: 640
 warmup_epochs: 2
-base_lr: 1e-4
+base_lr: 1e-3
 # gate_freeze_epochs: 20
 # rgcn_dim: 256
 

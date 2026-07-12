@@ -73,7 +73,7 @@ class PrototypeNet(nn.Module):
         Returns:
             (num_classes, hidden_dim) 平滑后的原型
         """
-        if self.parents_matrix is None:
+        if self.parents_matrix is None: 
             return self_proto
 
         # proto_w: (num_classes, num_classes)，proto_w[i][j] 是节点 i 对祖先 j 的权重

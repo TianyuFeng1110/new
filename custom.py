@@ -115,9 +115,9 @@ def main(args, config):
     # test_residue_feats = torch.load(os.path.join(features_path, 'residue_feats', f'test_{namespace.lower()}_residue_feats.pt'), weights_only=True, map_location='cpu')
     test_protein_feats = torch.load(os.path.join(features_path, 'protein_feats', f'test_{namespace.lower()}_protein_feats.pt'), weights_only=True, map_location='cpu')
     hier_reg_lambda = config.get('hier_reg_lambda', 0.1)
-    
     _, proto_idx_mask = utils.get_prototype_index_tensor(train_seq_data)
-    go_freq = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))[valid_mask]
+    go_freq, class_counts = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))
+    go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
 
     # 设置随机种子
     utils.set_random_seed(seed) 

@@ -58,7 +58,7 @@ class PrototypeCollator:
 
         protein_to_idx = {protein: i for i, protein in enumerate(unique_proteins)}
 
-        return inputs_feats, labels, support_feats, data2classes, torch.stack([torch.tensor([protein_to_idx[c] for c in c_list]) for c_list in support_indices], dim=0)
+        return inputs_feats, labels, support_feats, data2classes, torch.stack([torch.tensor([protein_to_idx[c] for c in c_list]) for c_list in support_indices], dim=0) # (每个类的支持蛋白质索引映射到 support_feats 的索引)
 
     def _get_labels(self, label_indices_list):
         """将每个蛋白质的 GO term 索引列表转换为二值标签向量。"""

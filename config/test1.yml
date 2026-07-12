@@ -11,4 +11,4 @@ n_support: 50                  # 每个 GO term 的支持蛋白质数（用于�
 
 alpha: 50
 lambda: 100
-beta: 2                       # 用来控制△IC衰减的速率
+beta: 1                       # 用来控制△IC衰减的速率

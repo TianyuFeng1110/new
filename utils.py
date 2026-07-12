@@ -2062,3 +2062,88 @@ def compute_ancestor_weights(hop_counts: torch.Tensor, class_counts: torch.Tenso
     weight = gamma * sample_factor.unsqueeze(0)
 
     return weight
+
+
+def compute_ic(go2id, train_seq_data, obo_path):
+    """基于训练集标注计算每个 GO term 的信息量 (IC)。
+
+    使用 goatools 的 TermCounts 沿 DAG 传播标注计数，
+    IC(go) = -log(freq(go))，freq 为传播后的归一化频率。
+    根节点（最泛化）IC≈0，越具体的 term IC 越大。
+
+    Args:
+        go2id:        dict[GO_ID -> {'ind': int, 'father': [...], 'child': [...]}]
+        train_seq_data: list[dict]，每个元素含 'label' 字段（GO term 类别索引列表）
+        obo_path:     go-basic.obo 文件路径
+
+    Returns:
+        ic: torch.Tensor, 形状 (num_classes,)，按 go2id 的 ind 索引排列
+    """
+    from goatools.obo_parser import GODag
+    from goatools.semantic import TermCounts
+
+    # 类别索引 -> GO ID
+    idx2go = {v['ind']: k for k, v in go2id.items() if isinstance(v, dict) and 'ind' in v}
+
+    # 构建 protein_id -> set(GO IDs)，TermCounts 要求此格式
+    gene2gos = {}
+    for i, item in enumerate(train_seq_data):
+        gos = {idx2go[idx] for idx in item.get('label', []) if idx in idx2go}
+        if gos:
+            gene2gos[i] = gos
+
+    godag = GODag(obo_path, optional_attrs={'relationship'})
+    tcnt = TermCounts(godag, gene2gos)
+
+    ic = np.zeros(len(go2id), dtype=np.float64)
+    for go_id, info in go2id.items():
+        if isinstance(info, dict) and 'ind' in info:
+            freq = tcnt.get_term_freq(go_id)
+            ic[info['ind']] = -math.log(freq) if freq > 0 else 0.0
+
+    return torch.from_numpy(ic).float()
+
+
+def compute_ancestor_weights_ic(hop_counts: torch.Tensor, ic: torch.Tensor,
+                                class_counts: torch.Tensor, lambda_: float,
+                                beta_: float = 1.0) -> torch.Tensor:
+    """基于信息量 (IC) 计算每个 GO term 节点对其祖先节点的参考权重矩阵。
+
+    权重公式: exp(-β * max(ΔIC, 0)) * n / (n + λ)
+
+    - ΔIC = IC(ancestor) - IC(node)：祖先与当前节点的信息量差。
+      ΔIC <= 0 表示祖先更具体（罕见），权重为 1（不衰减）；
+      ΔIC > 0 表示祖先更泛化（常见），IC 差越大权重越低。
+      相比跳数，IC 直接反映生物学特异性，泛化程度高的祖先权重低。
+    - n = class_counts[j]：祖先节点 j 的正样本数，样本量越大越可靠。
+    - λ：控制样本量对权重的影响程度。
+    - β：控制 IC 差对权重的衰减速度，β 越大对泛化祖先惩罚越强。
+
+    Args:
+        hop_counts:  形状 (num_nodes, num_nodes)。
+                     hop_counts[i][j] > 0 表示 j 是 i 的祖先（仅用作祖先关系掩码）。
+        ic:          形状 (num_nodes,)，每个 GO term 的信息量。
+        class_counts: 形状 (num_nodes,)，每个 GO term 的正样本数。
+        lambda_:     超参数 λ，调节样本数量的影响。
+        beta_:       超参数 β，调节 IC 差的衰减速度。
+
+    Returns:
+        weight: 形状 (num_nodes, num_nodes)。
+                weight[i][j] 表示节点 i 对其祖先节点 j 的参考权重。
+                若 j 不是 i 的祖先，weight[i][j] = 0。
+    """
+    ancestor_mask = hop_counts > 0  # (num_nodes, num_nodes)
+
+    # ΔIC[i, j] = IC(j) - IC(i)，广播: ic[j] 按列, ic[i] 按行
+    ic_diff = ic.unsqueeze(1) - ic.unsqueeze(0)  # (num_nodes, num_nodes)
+    # 仅惩罚更泛化的祖先 (ΔIC > 0)，更具体的祖先不衰减
+    ic_factor = torch.exp(-beta_ * ic_diff.clamp(min=0.0))
+
+    # n / (n + λ)，样本量缩放因子（按列广播，对应祖先 j）
+    n = class_counts.float()
+    sample_factor = n / (n + lambda_)
+
+    weight = ic_factor * sample_factor.unsqueeze(0)
+    weight = weight * ancestor_mask.float()  # 非祖先位置置 0
+
+    return weight
