@@ -125,7 +125,7 @@ def main(args, config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Gate fusion: MLP + PrototypeNet')
     parser.add_argument('--device', type=str, default='cuda', help='device id')
-    parser.add_argument('--config', type=str, default='./config/cc.yml', help='config yml')
+    parser.add_argument('--config', type=str, default='./config/config.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--batch_size', type=int, default=1024, help='batch size')
     parser.add_argument('--epochs', type=int, default=100, help='epoch')
