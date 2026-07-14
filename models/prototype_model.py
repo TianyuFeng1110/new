@@ -63,26 +63,27 @@ class PrototypeNet(nn.Module):
         return logits, loss, self.temperature.mean()
     
     def _smooth_prototypes(self, self_proto):
-        """频率加权平滑：w * 自身原型 + (1 - w) * 最优祖先原型。
+        """频率加权平滑：w * 自身原型 + (1 - w) * 祖先原型加权平均。
 
-        最优祖先 = proto_w 中权重最大的祖先节点，其原型代替父节点原型。
-        罕见功能（正样本少）更多依赖稳定祖先原型(稳定权重由 proto_w 给出)；根节点（无祖先）回退为自身原型。
+        祖先原型 = 按 proto_w 权重对所有祖先原型做加权平均（归一化后）。
+        罕见功能（正样本少）更多依赖稳定祖先原型；根节点（无祖先）回退为自身原型。
 
         Args:
             self_proto: (num_classes, hidden_dim) 纯均值原型
         Returns:
             (num_classes, hidden_dim) 平滑后的原型
         """
-        if self.parents_matrix is None: 
+        if self.parents_matrix is None:
             return self_proto
 
         # proto_w: (num_classes, num_classes)，proto_w[i][j] 是节点 i 对祖先 j 的权重
-        # 每行取权重最大的祖先索引；无祖先的行 argmax 会返回 0，后续用 mask 屏蔽
-        best_ancestor = self.proto_w.argmax(dim=1)                 # (num_classes,)
-        has_ancestor = self.proto_w.sum(dim=1) > 0                 # (num_classes,)
-        stable_ancestor_proto = self_proto[best_ancestor]                   # (num_classes, hidden_dim)
+        # 按权重对所有祖先原型加权平均
+        weight_sum = self.proto_w.sum(dim=1, keepdim=True)                          # (num_classes, 1)
+        has_ancestor = weight_sum.squeeze(1) > 0                                    # (num_classes,)
+        stable_ancestor_proto = self.proto_w @ self_proto                           # (num_classes, hidden_dim) 加权和
+        stable_ancestor_proto = stable_ancestor_proto / weight_sum.clamp(min=1e-8)  # 归一化为加权平均
 
-        # 无祖先的根节点：父原型回退为自身原型
+        # 无祖先的根节点：回退为自身原型
         stable_ancestor_proto[~has_ancestor] = self_proto[~has_ancestor]
 
         w = (self.class_counts / (self.class_counts + self.smooth_tau)).unsqueeze(1)                   # (num_classes, 1)

@@ -69,6 +69,8 @@ def main(args, config):
     
     train_seq_data = utils.load_data_from_pkl(os.path.join(datasets_path, f"train_seq_{namespace.lower()}"))
     prototype_index, proto_idx_mask = utils.get_prototype_index_tensor(train_seq_data)
+    prototype_index[prototype_index[:, 0] == 0, 0] = 1
+    valid_mask = prototype_index.sum(dim=0) > 0
     go_freq = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))
 
     
@@ -90,7 +92,7 @@ def main(args, config):
     # 获取测试集的数据加载器 (这里 mode 传入 'test')
     _, test_loader = get_loader(
         datasets_path, namespace, args.batch_size, 
-        protein_feats, test_protein_feats, num_classes, mode='test'
+        protein_feats, test_protein_feats, num_classes, mode='test', valid_mask=valid_mask
     )
 
     # =========================================================

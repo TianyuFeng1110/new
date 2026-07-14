@@ -186,7 +186,7 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--config', type=str, default='./config/cc.yml')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--path', type=str, default="./data_tale/TALE/")
     parser.add_argument('--mode', type=str, default='test')
     parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')

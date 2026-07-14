@@ -11,7 +11,7 @@ import os
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from new.models.RGCN import Model
+from new.models.GCN import Model
 from ruamel.yaml import YAML
 
 @torch.no_grad()

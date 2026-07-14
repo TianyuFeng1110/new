@@ -1,8 +1,8 @@
 hidden_dim: 1024
 esm_dim: 640
-num_classes: 2574             # TALE cc:2574, CAFA3 cc:2434
-model_type: 2                # 0: cusotm, 1: cusotm + prototype 2：prototype
+num_classes: 2516             # TALE cc:2574, CAFA3 cc:2434
+model_type: 0                # 0: cusotm, 1: cusotm + prototype 2：prototype
 features_path: /archive/hot5/fty/TALE/
 checkpoint_path: /archive/hot5/fty/checkpoints/TALE/
-checkpoint: checkpoint_40.pth
+checkpoint: checkpoint_24.pth
 queue_size: 50

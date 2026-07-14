@@ -1401,7 +1401,8 @@ def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=N
             indices = indices.to(device)
 
             if prototypes is not None:
-                res = model(batch_feats, labels, None, None, prototypes)
+                # res = model(batch_feats, labels, None, None, prototypes)
+                res = model(batch_feats, prototypes, labels)
             else:
                 # res = model(batch_feats, labels)
                 res = model(batch_feats, indices, labels)
@@ -1485,7 +1486,8 @@ def eval_term_freq_generalizability(model, test_loader, device, go_freq, prototy
             indices = indices.to(device)
 
             if prototypes != None:
-                res = model(query=batch_feats, labels=labels, prototypes=prototypes)
+                # res = model(query=batch_feats, labels=labels, prototypes=prototypes)
+                res = model(input_feats=batch_feats, labels=labels, prototypes=prototypes)
             else:
                 res = model(batch_feats, indices, labels)
             final_probs = res[0]
