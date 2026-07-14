@@ -7,9 +7,9 @@ import numpy as np
 from ruamel.yaml import YAML
 from models.model import Model
 from models.custom_model import Model as CustomModel
-from models.test_model import PrototypeNet
-from datasets.cc_dataset import Dataset
-from datasets.cc_collator import collator
+from models.prototype_model import PrototypeNet
+from datasets.dataset import Dataset
+from datasets.collator import collator
 from torch.utils.data import DataLoader, SequentialSampler
 
 

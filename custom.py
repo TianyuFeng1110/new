@@ -7,8 +7,8 @@ import numpy as np
 
 from ruamel.yaml import YAML
 from models.custom_model import Model
-from datasets.cc_dataset import Dataset
-from datasets.cc_collator import collator
+from datasets.dataset import Dataset
+from datasets.collator import collator
 from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
 
 def get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, valid_mask):
