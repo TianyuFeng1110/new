@@ -1386,7 +1386,7 @@ def print_loss_gradients(model, train_loader, parent_indices, child_indices, dev
     print('=' * 60)
 
 
-def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=None):
+def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=None, model_type=None):
     print("Starting evaluation...")
 
     # 1. 收集所有预测概率和真实标签
@@ -1401,8 +1401,10 @@ def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=N
             indices = indices.to(device)
 
             if prototypes is not None:
-                # res = model(batch_feats, labels, None, None, prototypes)
-                res = model(batch_feats, prototypes, labels)
+                if model_type==2:
+                    res = model(batch_feats, labels, None, None, prototypes) # prototype
+                else:
+                    res = model(batch_feats, prototypes, labels)
             else:
                 # res = model(batch_feats, labels)
                 res = model(batch_feats, indices, labels)

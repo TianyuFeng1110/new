@@ -61,9 +61,8 @@ def valid(model, prototypes, valid_loader, epoch, device):
     all_labels = torch.cat(all_labels, dim=0).numpy()
     metric = utils.calculate_metrics(all_labels, all_probs)
     macro_aupr = utils.macro_auprc(all_labels, all_probs)
-    # print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(
-    #     metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
-    print("Averaged stats: {}, macro aupr: {:.4f}".format(metric_logger.global_avg(), macro_aupr))
+    print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
+    # print("Averaged stats: {}, macro aupr: {:.4f}".format(metric_logger.global_avg(), macro_aupr))
 
     return all_probs, all_labels
 
@@ -177,8 +176,6 @@ def main(args, config):
         os.makedirs("/archive/hot5/fty/checkpoints/TALE/prototype1", exist_ok=True)
         torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype1", 'checkpoint_%02d.pth' % epoch))
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes)
-        if epoch % 9 == 0:
-            utils.eval_term_freq_generalizability(model, valid_loader, device, go_freq, prototypes=prototypes)
 
 
 if __name__ == "__main__":

@@ -56,12 +56,12 @@ def valid(model, loader, epoch, device, scale, hier_reg_lambda, parent_indices, 
         metric_logger.update(custom_loss=custom_loss.item())
         metric_logger.update(hier_loss=0)
 
-    # metric = utils.calculate_metrics(torch.cat(all_labels, dim=0).numpy(), torch.cat(all_probs, dim=0).numpy())
-    # print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
-    all_probs = torch.cat(all_probs, dim=0).numpy()
-    all_labels = torch.cat(all_labels, dim=0).numpy()
-    macro_aupr = utils.macro_auprc(all_labels, all_probs)
-    print("Averaged stats: {}, macro aupr: {:.4f}".format(metric_logger.global_avg(), macro_aupr))
+    metric = utils.calculate_metrics(torch.cat(all_labels, dim=0).numpy(), torch.cat(all_probs, dim=0).numpy())
+    print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
+    # all_probs = torch.cat(all_probs, dim=0).numpy()
+    # all_labels = torch.cat(all_labels, dim=0).numpy()
+    # macro_aupr = utils.macro_auprc(all_labels, all_probs)
+    # print("Averaged stats: {}, macro aupr: {:.4f}".format(metric_logger.global_avg(), macro_aupr))
 
     return all_probs, all_labels
 
@@ -160,8 +160,6 @@ def main(args, config):
                 }
         torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/custom/", 'checkpoint_%02d.pth'%epoch))  
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, None)
-        if epoch % 9 == 0:
-            utils.eval_term_freq_generalizability(model, valid_loader, device, go_freq, prototypes=None)
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')

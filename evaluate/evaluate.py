@@ -149,8 +149,8 @@ def main(args, config):
     # =========================================================
     #                           评估
     # =========================================================
-    utils.eval_func_generalizability(model, test_loader, device, go_freq, prototypes)
-    utils.eval_term_freq_generalizability(model, test_loader, device, go_freq, prototypes)
+    utils.eval_func_generalizability(model, test_loader, device, go_freq, prototypes, model_type)
+    # utils.eval_term_freq_generalizability(model, test_loader, device, go_freq, prototypes)
     # =========================================================
     pass
 

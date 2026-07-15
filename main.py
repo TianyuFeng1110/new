@@ -101,7 +101,7 @@ def main(args, config):
         frequency=go_freq, parents_matrix=parents_matrix, class_counts=class_counts,
         proto_w=proto_w, smooth_tau=alpha_).to(device)
 
-    mlp_ckpt = torch.load("/archive/hot5/fty/checkpoints/TALE/custom/checkpoint_24.pth", map_location=device)
+    mlp_ckpt = torch.load("/archive/hot5/fty/checkpoints/TALE/custom/checkpoint_42.pth", map_location=device)
     mlp_model.load_state_dict(mlp_ckpt['model'])
     proto_ckpt = torch.load("/archive/hot5/fty/checkpoints/TALE/prototype/checkpoint_75.pth", map_location=device)
     proto_model.load_state_dict(proto_ckpt['model'])
