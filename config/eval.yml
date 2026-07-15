@@ -1,11 +1,11 @@
 hidden_dim: 1024
 esm_dim: 640
 num_classes: 2574             # TALE cc:2574, CAFA3 cc:2434（原始类别上界，经 valid_mask 过滤后自动调整）
-model_type: 2                # 0: custom, 1: custom + prototype (gate fusion), 2: prototype
+model_type: 1                # 0: custom, 1: custom + prototype (gate fusion), 2: prototype
 features_path: /archive/hot5/fty/TALE/
 checkpoint_path: /archive/hot5/fty/checkpoints/TALE/
 
-checkpoint_custom: checkpoint_24.pth
+checkpoint_custom: checkpoint_42.pth
 checkpoint_proto: checkpoint_75.pth
 
 # 原型网络超参（model_type=1/2 时使用）
