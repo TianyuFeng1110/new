@@ -96,15 +96,16 @@ def main(args, config):
     device = torch.device(args.device)
     seed = args.seed
     epochs = args.epochs
-    datasets_path = args.path
     batch_size = args.batch_size
-    namespace = args.namespace
-    mode = args.mode
+    dataset_name = config['dataset']
+    datasets_path = os.path.join(config['datasets_path'], dataset_name)
+    namespace = config['namespace']
+    mode = config['mode']
     base_lr = float(config['base_lr'])
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
-    num_classes = config['num_classes']
-    features_path = '/archive/hot5/fty/TALE/'
+    num_classes =  np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
+    features_path = os.path.join('/archive/hot5/fty/', dataset_name)
     train_seq_data = utils.load_data_from_pkl(os.path.join(datasets_path, f"train_seq_{namespace.lower()}"))
     prototype_index = utils.get_prototype_index(train_seq_data, num_classes)
     prototype_index[prototype_index[:, 0] == 0, 0] = 1 # 确保所有数据都注释了根go term的功能
@@ -158,7 +159,9 @@ def main(args, config):
                     'config': config,
                     'epoch': epoch,
                 }
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/custom/", 'checkpoint_%02d.pth'%epoch))  
+        
+        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "custom"), exist_ok=True)
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name ,"custom/", 'checkpoint_%02d.pth'%epoch))  
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, None)
 
 if __name__ == "__main__" : 
@@ -166,14 +169,9 @@ if __name__ == "__main__" :
     parser.add_argument('--device', type=str, default='cuda', help='device id')
     parser.add_argument('--config', type=str, default='./config/custom.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
-    parser.add_argument('--batch_size', type=int, default=1024, help='batch size') # CC:32, BP:4, MF:14
+    parser.add_argument('--batch_size', type=int, default=1024, help='batch size')
     parser.add_argument('--epochs', type=int, default=50, help='epoch')
-    # parser.add_argument('--path', type=str, default="./data_tale/CAFA3/", help='datasets path')
-    parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
-    parser.add_argument('--result_path', type=str, default="/archive/hot3/fty/result/", help='result save path')
-    parser.add_argument('--mode', type=str, default='test', help='[train/test]')
-    parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
-
+    
     args = parser.parse_args()
 
     torch.multiprocessing.set_sharing_strategy('file_system')

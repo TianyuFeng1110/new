@@ -71,13 +71,14 @@ def main(args, config):
     device = torch.device(args.device)
     seed = args.seed
     epochs = args.epochs
-    datasets_path = args.path
-    namespace = args.namespace
-    mode = args.mode
+    dataset_name = config['dataset']
+    datasets_path = os.path.join(config['datasets_path'], dataset_name)
+    namespace = config['namespace']
+    mode = config['mode']
     base_lr = float(config['base_lr'])
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
-    num_classes = config['num_classes']
+    num_classes = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
     n_way = config.get('n_way', 32)
     n_query = config.get('n_query', 4)
     n_support = config.get('n_support', 50)
@@ -85,7 +86,7 @@ def main(args, config):
     alpha_ = config.get('alpha')
     beta_ = config.get('beta')
     print('超参数alpha:', alpha_, 'lambda:', lambda_, 'beta:', beta_)
-    features_path = '/archive/hot5/fty/TALE/'
+    features_path = os.path.join('/archive/hot5/fty/', dataset_name)
     protein_feats = torch.load(
         os.path.join(features_path, 'protein_feats', f'train_{namespace.lower()}_protein_feats.pt'),
         weights_only=True, map_location='cpu')
@@ -116,15 +117,6 @@ def main(args, config):
     obo_path = os.path.join(datasets_path, 'go-basic.obo')
     ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
     proto_w = utils.compute_ancestor_weights_ic(hop_counts, ic, class_counts, lambda_, beta_)
-    # ---- valid_mask 过滤后需重映射层次边索引 ----
-    # _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
-    # old2new = torch.full((len(valid_mask),), -1, dtype=torch.long)
-    # old2new[valid_mask] = torch.arange(num_classes)
-    # edge_parents = torch.from_numpy(_edges[:, 0].copy()).long()
-    # edge_children = torch.from_numpy(_edges[:, 1].copy()).long()
-    # keep = (old2new[edge_parents] >= 0) & (old2new[edge_children] >= 0)
-    # parent_indices = old2new[edge_parents[keep]].to(device)
-    # child_indices = old2new[edge_children[keep]].to(device)
 
     utils.set_random_seed(seed)
 
@@ -173,9 +165,9 @@ def main(args, config):
             'config': config,
             'epoch': epoch,
         }
-        os.makedirs("/archive/hot5/fty/checkpoints/TALE/prototype1", exist_ok=True)
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/TALE/prototype1", 'checkpoint_%02d.pth' % epoch))
-        utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes)
+        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype"), exist_ok=True)
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype/", 'checkpoint_%02d.pth' % epoch))
+        utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes, model_type=2)
 
 
 if __name__ == "__main__":
@@ -184,9 +176,6 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, default='./config/prototype.yml')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--path', type=str, default="./data_tale/TALE/")
-    parser.add_argument('--mode', type=str, default='test')
-    parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
 
     args = parser.parse_args()
 

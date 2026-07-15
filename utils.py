@@ -1403,12 +1403,14 @@ def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=N
             if prototypes is not None:
                 if model_type==2:
                     res = model(batch_feats, labels, None, None, prototypes) # prototype
+                    final_probs = torch.sigmoid(res[0])  # 原型网络返回 logits，需 sigmoid
                 else:
                     res = model(batch_feats, prototypes, labels)
+                    final_probs = res[0]  # 其他模型 res[0] 已经是概率
             else:
                 # res = model(batch_feats, labels)
                 res = model(batch_feats, indices, labels)
-            final_probs = res[0]
+                final_probs = res[0]
 
             all_probs.append(final_probs.cpu())
             all_labels.append(labels.cpu())

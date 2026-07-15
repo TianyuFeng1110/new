@@ -2,8 +2,6 @@ hidden_dim: 1024
 esm_dim: 640
 base_lr: 5e-4
 
-num_classes: 2574             # TALE cc:2574, CAFA3 cc:2434
-
 # 原型网络参数
 n_way: 32                     # 每 batch 采样的 GO term 数
 n_query: 10                    # 每个 GO term 的查询蛋白质数
@@ -13,4 +11,8 @@ alpha: 50
 lambda: 30
 beta: 2                       # 用来控制△IC衰减的速率
 
+dataset: TALE
+datasets_path: './data_tale/'
+mode: test                    # [train/test]
+namespace: CC                 # [BP/CC/MF]
 # 支持集和查询集平分所有正样本，然后随机取样n_query和n_support，不足时重复抽样。

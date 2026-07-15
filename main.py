@@ -47,14 +47,15 @@ def evaluate(model, prototypes, loader, device, go_freq):
 def main(args, config):
     device = torch.device(args.device)
     seed = args.seed
-    datasets_path = args.path
     batch_size = args.batch_size
-    namespace = args.namespace
-    mode = args.mode
+    dataset_name = config['dataset']
+    datasets_path = os.path.join(config['datasets_path'], dataset_name)
+    namespace = config['namespace']
+    mode = config['mode']
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
-    num_classes = config['num_classes']
-    features_path = '/archive/hot5/fty/TALE/'
+    num_classes = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
+    features_path = os.path.join('/archive/hot5/fty/', dataset_name)
 
     # ---- 数据加载 ----
     train_seq_data = utils.load_data_from_pkl(os.path.join(datasets_path, f"train_seq_{namespace.lower()}"))
@@ -101,9 +102,9 @@ def main(args, config):
         frequency=go_freq, parents_matrix=parents_matrix, class_counts=class_counts,
         proto_w=proto_w, smooth_tau=alpha_).to(device)
 
-    mlp_ckpt = torch.load("/archive/hot5/fty/checkpoints/TALE/custom/checkpoint_42.pth", map_location=device)
+    mlp_ckpt = torch.load(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "/custom/", "checkpoint_42.pth"), map_location=device)
     mlp_model.load_state_dict(mlp_ckpt['model'])
-    proto_ckpt = torch.load("/archive/hot5/fty/checkpoints/TALE/prototype/checkpoint_75.pth", map_location=device)
+    proto_ckpt = torch.load(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "/prototype/", "checkpoint_75.pth"), map_location=device)
     proto_model.load_state_dict(proto_ckpt['model'])
 
     mlp_model.eval()
@@ -129,9 +130,6 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--batch_size', type=int, default=1024, help='batch size')
     parser.add_argument('--epochs', type=int, default=100, help='epoch')
-    parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
-    parser.add_argument('--mode', type=str, default='test', help='[train/test]')
-    parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
 
     args = parser.parse_args()
 
