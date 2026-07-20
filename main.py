@@ -120,7 +120,7 @@ def main(args, config):
 
     print('Evaluating with frequency-derived sigma...')
     evaluate(model, prototypes, loader, device, go_freq)
-    utils.eval_func_generalizability(model, loader, device, go_freq, prototypes)
+    utils.eval_func_generalizability(model, loader, device, go_freq, prototypes, model_type=1)
 
 
 if __name__ == "__main__":

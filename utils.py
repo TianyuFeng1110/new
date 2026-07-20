@@ -110,8 +110,10 @@ def set_random_seed(seed):
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
     torch.use_deterministic_algorithms(True)
 
+    return g
+
 def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
+    worker_seed = (torch.initial_seed() + worker_id) % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
@@ -1408,9 +1410,9 @@ def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=N
                     res = model(batch_feats, prototypes, labels)
                     final_probs = res[0]  # 其他模型 res[0] 已经是概率
             else:
-                # res = model(batch_feats, labels)
-                res = model(batch_feats, indices, labels)
-                final_probs = res[0]
+                if model_type==0:
+                    res = model(batch_feats, indices, labels)
+                    final_probs = res[0]
 
             all_probs.append(final_probs.cpu())
             all_labels.append(labels.cpu())

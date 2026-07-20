@@ -61,7 +61,8 @@ def valid(model, prototypes, valid_loader, epoch, device):
     all_labels = torch.cat(all_labels, dim=0).numpy()
     metric = utils.calculate_metrics(all_labels, all_probs)
     macro_aupr = utils.macro_auprc(all_labels, all_probs)
-    print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
+    print("Averaged stats(Valid): {}, Fmax: {:.4f}, micro AUPRC: {:.4f}".format(
+        metric_logger.global_avg(), metric['Fmax'], metric['micro_AUPRC']))
     # print("Averaged stats: {}, macro aupr: {:.4f}".format(metric_logger.global_avg(), macro_aupr))
 
     return all_probs, all_labels
@@ -118,7 +119,7 @@ def main(args, config):
     ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
     proto_w = utils.compute_ancestor_weights_ic(hop_counts, ic, class_counts, lambda_, beta_)
 
-    utils.set_random_seed(seed)
+    g = utils.set_random_seed(seed)
 
     # ---- 训练 DataLoader：原型网络采样 ----
     # 注意：train_mode='test' 避免 shuffle 导致索引错位
@@ -130,29 +131,30 @@ def main(args, config):
         protein_feats=protein_feats, n_way=n_way, support=support, sampler=train_sampler,
         n_query=n_query, n_support=n_support, num_classes=num_classes)
     train_loader = DataLoader(
-        raw_dataset, batch_sampler=train_sampler, collate_fn=train_collator, num_workers=2)
+        raw_dataset, batch_sampler=train_sampler, collate_fn=train_collator, num_workers=0,
+        generator=g, worker_init_fn=utils.seed_worker)
 
     # ---- 验证 DataLoader：全类预测 ----
     valid_dataset = Dataset(datasets_path, namespace, train_mode=mode, dataset_mode='test', valid_mask=valid_mask)
     test_collator = collator(num_classes, test_protein_feats)
     valid_loader = DataLoader(
         valid_dataset, batch_size=n_query*n_way, shuffle=False,
-        sampler=SequentialSampler(valid_dataset), drop_last=False, num_workers=2,
+        sampler=SequentialSampler(valid_dataset), drop_last=False, num_workers=0,
         collate_fn=test_collator,
-        worker_init_fn=utils.seed_worker)
+        generator=g, worker_init_fn=utils.seed_worker)
 
     # ---- 模型 ----
     model = PrototypeNet(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes, frequency=go_freq, parents_matrix=parents_matrix, class_counts=class_counts, proto_w=proto_w, smooth_tau=alpha_).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=base_lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
     print('start training......')
 
     for epoch in range(epochs):
         # 训练
         train(model, optimizer, train_loader, epoch, device)
-        scheduler.step()
+        # scheduler.step()
 
         # 验证
         prototypes = model._get_prototypes(all_feats, prototype_index.to(device))
@@ -161,12 +163,12 @@ def main(args, config):
         save_obj = {
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
+            # 'scheduler': scheduler.state_dict(),
             'config': config,
             'epoch': epoch,
         }
         os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype"), exist_ok=True)
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype/", 'checkpoint_%02d.pth' % epoch))
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype", 'checkpoint_%02d.pth' % epoch))
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes, model_type=2)
 
 
@@ -174,7 +176,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Prototypical Network for Protein Function Prediction')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--config', type=str, default='./config/prototype.yml')
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=100)
 
     args = parser.parse_args()

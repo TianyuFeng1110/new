@@ -1,6 +1,6 @@
 hidden_dim: 1024
 esm_dim: 640
-base_lr: 5e-4
+base_lr: 4e-3
 
 # 原型网络参数
 n_way: 32                     # 每 batch 采样的 GO term 数

@@ -34,7 +34,6 @@ class Dataset(Dataset):
 
         # 从训练集中随机划分验证集
         if train_mode == 'train':
-            random.seed(42)
             random.shuffle(data)
             self.split_idx = int(len(data) * (1 - val_ratio))
             self.data = data[:self.split_idx]

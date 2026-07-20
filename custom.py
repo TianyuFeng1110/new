@@ -11,24 +11,26 @@ from datasets.dataset import Dataset
 from datasets.collator import collator
 from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
 
-def get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, valid_mask):
+def get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, valid_mask, g):
     dataset = Dataset(datasets_path, namespace, train_mode=mode, dataset_mode='train', valid_mask=valid_mask)
 
     if mode == 'train': valid_dataset = dataset.val_dataset
     else: valid_dataset = Dataset(datasets_path, namespace, train_mode=mode, dataset_mode='test', valid_mask=valid_mask)
 
-    train_sampler = RandomSampler(dataset)
+    train_sampler = RandomSampler(dataset, generator=g)
     valid_sampler = SequentialSampler(valid_dataset)
     train_loader = DataLoader(
             dataset, batch_size=batch_size, shuffle=False,
-            sampler=train_sampler, drop_last=True, num_workers=2,
+            sampler=train_sampler, drop_last=True, num_workers=0,
             collate_fn=collator(num_classes, protein_feats),
+            generator=g,
             worker_init_fn=utils.seed_worker
         )
     valid_loader = DataLoader(
             valid_dataset, batch_size=batch_size, shuffle=False,
-            sampler=valid_sampler, drop_last=False, num_workers=2,
+            sampler=valid_sampler, drop_last=False, num_workers=0,
             collate_fn=collator(num_classes, test_protein_feats),
+            generator=g,
             worker_init_fn=utils.seed_worker
         )
     return train_loader, valid_loader
@@ -121,9 +123,9 @@ def main(args, config):
     go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
 
     # 设置随机种子
-    utils.set_random_seed(seed) 
+    g = utils.set_random_seed(seed) 
 
-    train_loader, valid_loader = get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, valid_mask)
+    train_loader, valid_loader = get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, valid_mask, g)
 
     model = Model(
         input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes
@@ -162,7 +164,7 @@ def main(args, config):
         
         os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "custom"), exist_ok=True)
         torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name ,"custom/", 'checkpoint_%02d.pth'%epoch))  
-        utils.eval_func_generalizability(model, valid_loader, device, go_freq, None)
+        utils.eval_func_generalizability(model, valid_loader, device, go_freq, None, model_type=0)
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')

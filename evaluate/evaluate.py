@@ -25,19 +25,21 @@ def get_test_loader(datasets_path, namespace, batch_size, test_protein_feats, nu
 def main(args, config):
     device = torch.device(args.device)
 
-    datasets_path = args.path
     namespace = args.namespace
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     model_type = config['model_type']
-    features_path = config['features_path']
-    checkpoint_path = config['checkpoint_path']
+    dataset_name = config['dataset']
+    features_path = os.path.join(config['features_path'], dataset_name)
+    checkpoint_path = os.path.join(config['checkpoint_path'], dataset_name)
+    dataset_name = config['dataset']
+    datasets_path = os.path.join(config['datasets_path'], dataset_name)
 
     # ---- 1. 加载基础数据（所有模型共用） ----
     train_seq_data = utils.load_data_from_pkl(os.path.join(datasets_path, f"train_seq_{namespace.lower()}"))
 
     # 构建 (N_protein × num_classes) 的二值标注矩阵并过滤无效类
-    num_classes_raw = config['num_classes']
+    num_classes_raw = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
     prototype_index = utils.get_prototype_index(train_seq_data, num_classes_raw)
     prototype_index[prototype_index[:, 0] == 0, 0] = 1          # 确保根 GO term 至少有一条标注
     valid_mask = prototype_index.sum(dim=0) > 0
@@ -158,7 +160,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Evaluate CC Model')
     parser.add_argument('--device', type=str, default='cuda', help='device id')
     parser.add_argument('--config', type=str, default='./config/eval.yml', help='config yml')
-    parser.add_argument('--path', type=str, default="./data_tale/TALE/", help='datasets path')
     parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
     parser.add_argument('--batch_size', type=int, default=512, help='batch size')
 
