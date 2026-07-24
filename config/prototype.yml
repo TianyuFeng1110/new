@@ -7,11 +7,11 @@ n_way: 32                     # 每 batch 采样的 GO term 数
 n_query: 10                    # 每个 GO term 的查询蛋白质数
 n_support: 50                  # 每个 GO term 的支持蛋白质数（用于计算原型）
 
-alpha: 50
-lambda: 30
+alpha: 20                    # TALE alpha 50 lambda 30
+lambda: 10
 beta: 2                       # 用来控制△IC衰减的速率
 
-dataset: TALE
+dataset: CAFA3
 datasets_path: './data_tale/'
 mode: test                    # [train/test]
 namespace: CC                 # [BP/CC/MF]

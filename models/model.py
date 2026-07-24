@@ -6,18 +6,20 @@ import torch.nn.functional as F
 class Model(nn.Module):
     """门控融合：冻结的 MLP 分类头 + 冻结的原型网络。
 
-    sigma = (log_freq - min_log) / (max_log - min_log)
+    sigma = pow((log_freq - min_log) / (max_log - min_log), power)
         - 对 GO term 频率做 log 变换后 min-max 归一化到 [0, 1]
-        - 零自定义参数：min/max 完全来自数据自身的 log-频率分布
-        - 可解释性：sigma = 0.3 表示该功能在 log-频率谱上位于最罕见到最常见之间的 30% 位置
+        - 幂指数 power > 1 时压缩中低频 sigma → 更激进地压制 MLP 贡献
+        - power=1 退化为线性 min-max；power=3 为推荐值
+        - power 越大，低频功能越依赖 ProtoNet，高频功能仍保持 MLP 主导
 
     final_probs = sigma * mlp_probs + (1 - sigma) * proto_probs
     高频功能 sigma→1（MLP 主导），低频功能 sigma→0（原型网络主导）。
     """
 
-    def __init__(self, mlp_model, proto_model, go_freq):
+    def __init__(self, mlp_model, proto_model, go_freq, power=2):
         super().__init__()
         self.num_classes = go_freq.shape[0]
+        self.power = power
 
         # 两个预训练模型，冻结不参与训练
         self.mlp_model = mlp_model
@@ -27,13 +29,15 @@ class Model(nn.Module):
         for p in self.proto_model.parameters():
             p.requires_grad = False
 
-        # ---- 纯数学计算 sigma：log-频率 min-max 归一化 ----
+        # ---- 纯数学计算 sigma：log-频率 min-max 归一化 + 幂压缩 ----
         log_freq = torch.log(go_freq + 1e-8)
         min_log = log_freq.min()
         max_log = log_freq.max()
-        sigma = (log_freq - min_log) / (max_log - min_log).clamp(min=1e-8)
+        sigma_raw = (log_freq - min_log) / (max_log - min_log).clamp(min=1e-8)
+        sigma = sigma_raw ** power   # 幂压缩：低频 sigma 被大幅压低
 
         self.register_buffer('sigma', sigma)
+        self.register_buffer('sigma_raw', sigma_raw)
         self.register_buffer('log_freq', log_freq)
 
     def train(self, mode=True):

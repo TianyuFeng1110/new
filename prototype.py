@@ -86,7 +86,7 @@ def main(args, config):
     lambda_ = config.get('lambda')
     alpha_ = config.get('alpha')
     beta_ = config.get('beta')
-    print('超参数alpha:', alpha_, 'lambda:', lambda_, 'beta:', beta_)
+    print('数据集:', dataset_name, '超参数alpha:', alpha_, 'lambda:', lambda_, 'beta:', beta_)
     features_path = os.path.join('/archive/hot5/fty/', dataset_name)
     protein_feats = torch.load(
         os.path.join(features_path, 'protein_feats', f'train_{namespace.lower()}_protein_feats.pt'),
@@ -108,15 +108,41 @@ def main(args, config):
     go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
     adj_matrix = utils.load_npy_file(os.path.join(datasets_path, f"{namespace.lower()}_adj_matrix.npy"))
     adj_matrix = adj_matrix[valid_mask][:, valid_mask]
-    go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
-    parents_matrix, childs_matrix = utils.get_go_adjacency_matrices(go2id)
-    parents_matrix = parents_matrix[valid_mask][:, valid_mask]
     _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
     hop_counts = utils.get_ancestor_hop_matrix(_edges) # 每个节点到任意祖先节点的跳数
     hop_counts = hop_counts[valid_mask][:, valid_mask]
     # proto_w = utils.compute_ancestor_weights(hop_counts, class_counts, lambda_)
-    obo_path = os.path.join(datasets_path, 'go-basic.obo')
-    ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
+    if dataset_name == 'TALE':
+        # TALE 数据集：通过 go2id pickle 构建 parents_matrix，并用 goatools 计算 IC
+        go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
+        parents_matrix, childs_matrix = utils.get_go_adjacency_matrices(go2id)
+        parents_matrix = parents_matrix[valid_mask][:, valid_mask]
+        obo_path = os.path.join(datasets_path, 'go-basic.obo')
+        ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
+    else:
+        # CAFA3 数据集：缺少可靠的 *_go_1.pickle，直接从 label_regular_1.npy 和 train_seq_data 计算
+        # 1) parents_matrix：label_regular_1.npy 中每行为 [parent, child]，构建 child->parent 邻接矩阵
+        num_nodes = int(_edges.max()) + 1
+        parents_matrix = np.zeros((num_nodes, num_nodes), dtype=int)
+        for parent, child in _edges:
+            parents_matrix[int(child)][int(parent)] = 1
+        parents_matrix = parents_matrix[valid_mask][:, valid_mask]
+        # 2) ic：train_seq_data 的 label 字段已沿 DAG 传播祖先标注，
+        #    故直接统计每个类别索引的蛋白质数，除以根节点（最大计数）得到频率，
+        #    IC = -log(freq)。与 goatools TermCounts 结果一致（已在 TALE 上验证）。
+        from collections import Counter
+        import math
+        label_counts = Counter()
+        for item in train_seq_data:
+            for idx in item.get('label', []):
+                label_counts[idx] += 1
+        total_count = max(label_counts.values()) if label_counts else 1  # 根节点计数
+        ic = np.zeros(num_nodes, dtype=np.float64)
+        for idx in range(num_nodes):
+            cnt = label_counts.get(idx, 0)
+            freq = cnt / total_count if total_count > 0 else 0.0
+            ic[idx] = -math.log(freq) if freq > 0 else 0.0
+        ic = torch.from_numpy(ic).float()[valid_mask]
     proto_w = utils.compute_ancestor_weights_ic(hop_counts, ic, class_counts, lambda_, beta_)
 
     g = utils.set_random_seed(seed)

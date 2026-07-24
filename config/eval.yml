@@ -5,8 +5,8 @@ model_type: 1                # 0: custom, 1: custom + prototype (gate fusion), 2
 features_path: /archive/hot5/fty/
 checkpoint_path: /archive/hot5/fty/checkpoints/
 
-checkpoint_custom: checkpoint_42.pth # TALE42
-checkpoint_proto: checkpoint_68.pth # TALE68
+checkpoint_custom: checkpoint_42.pth # TALE 42 CAFA3 39
+checkpoint_proto: checkpoint_68.pth # TALE 68 CAFA3 92
 
 dataset: TALE
 datasets_path: './data_tale/'
