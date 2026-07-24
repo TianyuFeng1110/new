@@ -86,7 +86,7 @@ class PrototypeNet(nn.Module):
         # 无祖先的根节点：回退为自身原型
         stable_ancestor_proto[~has_ancestor] = self_proto[~has_ancestor]
 
-        w = (self.class_counts / (self.class_counts + self.smooth_tau)).unsqueeze(1)                   # (num_classes, 1)
+        w = (self.class_counts / (self.class_counts + self.smooth_tau)).unsqueeze(1) # (num_classes, 1) zero-shot的功能由于class_counts为0，计算出的w为0，因此原型刚好是由其祖先加权得来的
         return w * self_proto + (1.0 - w) * stable_ancestor_proto
 
     def predict(self, query_emb, prototypes):

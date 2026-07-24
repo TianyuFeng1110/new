@@ -86,6 +86,7 @@ def main(args, config):
     lambda_ = config.get('lambda')
     alpha_ = config.get('alpha')
     beta_ = config.get('beta')
+    is_zero_shot = config.get('zero_shot') # 是否启用zero-shot预测，不启用则会过滤训练数据为0的标签
     print('数据集:', dataset_name, '超参数alpha:', alpha_, 'lambda:', lambda_, 'beta:', beta_)
     features_path = os.path.join('/archive/hot5/fty/', dataset_name)
     protein_feats = torch.load(
@@ -98,27 +99,28 @@ def main(args, config):
     prototype_index = utils.get_prototype_index(train_seq_data, num_classes)
     prototype_index[prototype_index[:, 0] == 0, 0] = 1 # 确保所有数据都注释了根go term的功能
     valid_mask = prototype_index.sum(dim=0) > 0  # 形状为 (标签类别数,) 的布尔 Tensor
-    prototype_index = prototype_index[:, valid_mask] # 过滤没有正样本的标签
+    if not is_zero_shot: prototype_index = prototype_index[:, valid_mask] # 过滤没有正样本的标签
     pos_indices = prototype_index.T  # (num_classes, num_proteins)
     num_classes = pos_indices.shape[0]  # 更新 num_classes 为有效标签数
     indices = sorted(protein_feats.keys(), key=int)
     all_feats = torch.stack([protein_feats[k] for k in indices], dim=0).to(device)
     _, proto_idx_mask = utils.get_prototype_index_tensor(train_seq_data)
     go_freq, class_counts = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))
-    go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
+    if not is_zero_shot: go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
     adj_matrix = utils.load_npy_file(os.path.join(datasets_path, f"{namespace.lower()}_adj_matrix.npy"))
-    adj_matrix = adj_matrix[valid_mask][:, valid_mask]
+    if not is_zero_shot: adj_matrix = adj_matrix[valid_mask][:, valid_mask]
     _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
     hop_counts = utils.get_ancestor_hop_matrix(_edges) # 每个节点到任意祖先节点的跳数
-    hop_counts = hop_counts[valid_mask][:, valid_mask]
+    if not is_zero_shot: hop_counts = hop_counts[valid_mask][:, valid_mask]
     # proto_w = utils.compute_ancestor_weights(hop_counts, class_counts, lambda_)
     if dataset_name == 'TALE':
         # TALE 数据集：通过 go2id pickle 构建 parents_matrix，并用 goatools 计算 IC
         go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
         parents_matrix, childs_matrix = utils.get_go_adjacency_matrices(go2id)
-        parents_matrix = parents_matrix[valid_mask][:, valid_mask]
+        if not is_zero_shot: parents_matrix = parents_matrix[valid_mask][:, valid_mask]
         obo_path = os.path.join(datasets_path, 'go-basic.obo')
-        ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
+        ic = utils.compute_ic(go2id, train_seq_data, obo_path)
+        if not is_zero_shot: ic = ic[valid_mask]
     else:
         # CAFA3 数据集：缺少可靠的 *_go_1.pickle，直接从 label_regular_1.npy 和 train_seq_data 计算
         # 1) parents_matrix：label_regular_1.npy 中每行为 [parent, child]，构建 child->parent 邻接矩阵
@@ -126,7 +128,7 @@ def main(args, config):
         parents_matrix = np.zeros((num_nodes, num_nodes), dtype=int)
         for parent, child in _edges:
             parents_matrix[int(child)][int(parent)] = 1
-        parents_matrix = parents_matrix[valid_mask][:, valid_mask]
+        if not is_zero_shot: parents_matrix = parents_matrix[valid_mask][:, valid_mask]
         # 2) ic：train_seq_data 的 label 字段已沿 DAG 传播祖先标注，
         #    故直接统计每个类别索引的蛋白质数，除以根节点（最大计数）得到频率，
         #    IC = -log(freq)。与 goatools TermCounts 结果一致（已在 TALE 上验证）。
@@ -142,14 +144,15 @@ def main(args, config):
             cnt = label_counts.get(idx, 0)
             freq = cnt / total_count if total_count > 0 else 0.0
             ic[idx] = -math.log(freq) if freq > 0 else 0.0
-        ic = torch.from_numpy(ic).float()[valid_mask]
+        ic = torch.from_numpy(ic).float()
+        if not is_zero_shot: ic = ic[valid_mask]
     proto_w = utils.compute_ancestor_weights_ic(hop_counts, ic, class_counts, lambda_, beta_)
 
     g = utils.set_random_seed(seed)
 
     # ---- 训练 DataLoader：原型网络采样 ----
     # 注意：train_mode='test' 避免 shuffle 导致索引错位
-    raw_dataset = Dataset(datasets_path, namespace, train_mode='test', dataset_mode='train', valid_mask=valid_mask)
+    raw_dataset = Dataset(datasets_path, namespace, train_mode='test', dataset_mode='train', valid_mask=(None if is_zero_shot else valid_mask))
     _pos_pools = [torch.nonzero(pos_indices[c]).squeeze(1).tolist() for c in range(pos_indices.shape[0])]
     support, query = utils.get_support_query_indices(_pos_pools)
     train_sampler = PrototypeSampler(query, n_way=n_way, n_query=n_query)
@@ -161,7 +164,7 @@ def main(args, config):
         generator=g, worker_init_fn=utils.seed_worker)
 
     # ---- 验证 DataLoader：全类预测 ----
-    valid_dataset = Dataset(datasets_path, namespace, train_mode=mode, dataset_mode='test', valid_mask=valid_mask)
+    valid_dataset = Dataset(datasets_path, namespace, train_mode=mode, dataset_mode='test', valid_mask=(None if is_zero_shot else valid_mask))
     test_collator = collator(num_classes, test_protein_feats)
     valid_loader = DataLoader(
         valid_dataset, batch_size=n_query*n_way, shuffle=False,
@@ -193,8 +196,8 @@ def main(args, config):
             'config': config,
             'epoch': epoch,
         }
-        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype"), exist_ok=True)
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype", 'checkpoint_%02d.pth' % epoch))
+        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype_zeroshot"), exist_ok=True)
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype_zeroshot", 'checkpoint_%02d.pth' % epoch))
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes, model_type=2)
 
 

@@ -42,7 +42,9 @@ class PrototypeCollator:
         support_indices = []
         for c in range(len(self.support)):
             pool = self.support[c]
-            if len(pool) < self.n_support:
+            if len(pool)==0: # zero-shot的功能支持集为空，其原型直接通过祖先原型计算
+                indices=[]
+            elif len(pool) < self.n_support:
                 indices =  random.sample(pool, len(pool)) + random.choices(pool, k=self.n_support - len(pool))
             else:
                 indices =  random.sample(pool, self.n_support)
@@ -58,7 +60,7 @@ class PrototypeCollator:
 
         protein_to_idx = {protein: i for i, protein in enumerate(unique_proteins)}
 
-        return inputs_feats, labels, support_feats, data2classes, torch.stack([torch.tensor([protein_to_idx[c] for c in c_list]) for c_list in support_indices], dim=0) # (每个类的支持蛋白质索引映射到 support_feats 的索引)
+        return inputs_feats, labels, support_feats, data2classes, torch.stack([torch.tensor([protein_to_idx[c] for c in c_list] if c_list else [0] * self.n_support) for c_list in support_indices], dim=0) # (每个类的支持蛋白质索引映射到 support_feats 的索引)，若zero-shot则使用0向量代替，forward中由于该功能样本数量为0，会使得计算出的w为0(原型全用祖先节点加权代替)
 
     def _get_labels(self, label_indices_list):
         """将每个蛋白质的 GO term 索引列表转换为二值标签向量。"""
