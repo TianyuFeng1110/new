@@ -11,10 +11,10 @@ alpha: 20                    # TALE alpha 50 lambda 30
 lambda: 10
 beta: 2                       # 用来控制△IC衰减的速率
 
-dataset: CAFA3
+dataset: TALE
 datasets_path: './data_tale/'
 mode: test                    # [train/test]
 namespace: CC                 # [BP/CC/MF]
 # 支持集和查询集平分所有正样本，然后随机取样n_query和n_support，不足时重复抽样。
 
-zero_shot: False # 是否启用zero-shot的预测
+zero_shot: True # 是否启用zero-shot的预测

@@ -196,8 +196,8 @@ def main(args, config):
             'config': config,
             'epoch': epoch,
         }
-        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype_zeroshot"), exist_ok=True)
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "prototype_zeroshot", 'checkpoint_%02d.pth' % epoch))
+        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "prototype"), exist_ok=True)
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "prototype", 'checkpoint_%02d.pth' % epoch))
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes, model_type=2)
 
 

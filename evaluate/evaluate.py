@@ -25,13 +25,14 @@ def get_test_loader(datasets_path, namespace, batch_size, test_protein_feats, nu
 def main(args, config):
     device = torch.device(args.device)
 
-    namespace = args.namespace
+    namespace = config['namespace']
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     model_type = config['model_type']
     dataset_name = config['dataset']
+    is_zero_shot = config['zero_shot']
     features_path = os.path.join(config['features_path'], dataset_name)
-    checkpoint_path = os.path.join(config['checkpoint_path'], dataset_name)
+    checkpoint_path = os.path.join(config['checkpoint_path'], namespace, dataset_name)
     dataset_name = config['dataset']
     datasets_path = os.path.join(config['datasets_path'], dataset_name)
 
@@ -43,8 +44,8 @@ def main(args, config):
     prototype_index = utils.get_prototype_index(train_seq_data, num_classes_raw)
     prototype_index[prototype_index[:, 0] == 0, 0] = 1          # 确保根 GO term 至少有一条标注
     valid_mask = prototype_index.sum(dim=0) > 0
-    prototype_index = prototype_index[:, valid_mask]             # (N_protein, num_classes)
-    num_classes = valid_mask.sum().item()
+    if not is_zero_shot: prototype_index = prototype_index[:, valid_mask]             # (N_protein, num_classes)
+    num_classes = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
 
     # 训练/测试蛋白质特征
     protein_feats = torch.load(
@@ -59,7 +60,7 @@ def main(args, config):
 
     # ---- 2. 测试 DataLoader ----
     test_loader = get_test_loader(datasets_path, namespace, args.batch_size,
-                                  test_protein_feats, num_classes, valid_mask)
+                                  test_protein_feats, num_classes, (None if is_zero_shot else valid_mask))
 
     # ---- 3. 按 model_type 构建模型、加载权重 ----
     prototypes = None
@@ -82,12 +83,13 @@ def main(args, config):
         # 原型网络所需的层次结构数据
         go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
         parents_matrix, _ = utils.get_go_adjacency_matrices(go2id)
-        parents_matrix = parents_matrix[valid_mask][:, valid_mask]
+        if not is_zero_shot: parents_matrix = parents_matrix[valid_mask][:, valid_mask]
         _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
         hop_counts = utils.get_ancestor_hop_matrix(_edges)
-        hop_counts = hop_counts[valid_mask][:, valid_mask]
+        if not is_zero_shot: hop_counts = hop_counts[valid_mask][:, valid_mask]
         obo_path = os.path.join(datasets_path, 'go-basic.obo')
-        ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
+        ic = utils.compute_ic(go2id, train_seq_data, obo_path)
+        if not is_zero_shot: ic = ic[valid_mask]
         proto_w = utils.compute_ancestor_weights_ic(
             hop_counts, ic, class_counts, config.get('lambda', 30), config.get('beta', 2))
         alpha_ = config.get('alpha', 50)
@@ -118,12 +120,13 @@ def main(args, config):
 
         go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
         parents_matrix, _ = utils.get_go_adjacency_matrices(go2id)
-        parents_matrix = parents_matrix[valid_mask][:, valid_mask]
+        if not is_zero_shot: parents_matrix = parents_matrix[valid_mask][:, valid_mask]
         _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
         hop_counts = utils.get_ancestor_hop_matrix(_edges)
-        hop_counts = hop_counts[valid_mask][:, valid_mask]
+        if not is_zero_shot: hop_counts = hop_counts[valid_mask][:, valid_mask]
         obo_path = os.path.join(datasets_path, 'go-basic.obo')
-        ic = utils.compute_ic(go2id, train_seq_data, obo_path)[valid_mask]
+        ic = utils.compute_ic(go2id, train_seq_data, obo_path)
+        if not is_zero_shot: ic = ic[valid_mask]
         proto_w = utils.compute_ancestor_weights_ic(
             hop_counts, ic, class_counts, config.get('lambda', 30), config.get('beta', 2))
         alpha_ = config.get('alpha', 50)
@@ -151,8 +154,6 @@ def main(args, config):
     # =========================================================
     #                           评估
     # =========================================================
-    utils.eval_func_generalizability(mlp_model, test_loader, device, go_freq, prototypes, 0)
-    utils.eval_func_generalizability(proto_model, test_loader, device, go_freq, prototypes, 2)
     utils.eval_func_generalizability(model, test_loader, device, go_freq, prototypes, model_type)
     # utils.eval_term_freq_generalizability(model, test_loader, device, go_freq, prototypes)
     # =========================================================
@@ -162,7 +163,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Evaluate CC Model')
     parser.add_argument('--device', type=str, default='cuda', help='device id')
     parser.add_argument('--config', type=str, default='./config/eval.yml', help='config yml')
-    parser.add_argument('--namespace', default='CC', type=str, help='[BP/CC/MF]')
     parser.add_argument('--batch_size', type=int, default=512, help='batch size')
 
     args = parser.parse_args()

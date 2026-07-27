@@ -106,13 +106,14 @@ def main(args, config):
     base_lr = float(config['base_lr'])
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
+    is_zero_shot = config['zero_shot']
     num_classes =  np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
     features_path = os.path.join('/archive/hot5/fty/', dataset_name)
     train_seq_data = utils.load_data_from_pkl(os.path.join(datasets_path, f"train_seq_{namespace.lower()}"))
     prototype_index = utils.get_prototype_index(train_seq_data, num_classes)
     prototype_index[prototype_index[:, 0] == 0, 0] = 1 # 确保所有数据都注释了根go term的功能
     valid_mask = prototype_index.sum(dim=0) > 0  # 形状为 (标签类别数,) 的布尔 Tensor
-    num_classes = valid_mask.sum().item()  # 更新 num_classes 为有效标签数
+    if not is_zero_shot: num_classes = valid_mask.sum().item()  # 更新 num_classes 为有效标签数
     # residue_feats = torch.load(os.path.join(features_path, 'residue_feats', f'train_{namespace.lower()}_residue_feats.pt'), weights_only=True, map_location='cpu')
     protein_feats = torch.load(os.path.join(features_path, 'protein_feats', f'train_{namespace.lower()}_protein_feats.pt'), weights_only=True, map_location='cpu')
     # test_residue_feats = torch.load(os.path.join(features_path, 'residue_feats', f'test_{namespace.lower()}_residue_feats.pt'), weights_only=True, map_location='cpu')
@@ -120,12 +121,15 @@ def main(args, config):
     hier_reg_lambda = config.get('hier_reg_lambda', 0.1)
     _, proto_idx_mask = utils.get_prototype_index_tensor(train_seq_data)
     go_freq, class_counts = utils.compute_go_term_frequency(proto_idx_mask, len(train_seq_data))
-    go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
+    if not is_zero_shot: go_freq, class_counts = go_freq[valid_mask], class_counts[valid_mask]
 
     # 设置随机种子
     g = utils.set_random_seed(seed) 
 
-    train_loader, valid_loader = get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, valid_mask, g)
+    if not is_zero_shot:
+        train_loader, valid_loader = get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, valid_mask, g)
+    else:
+        train_loader, valid_loader = get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, None, g)
 
     model = Model(
         input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes
@@ -162,8 +166,8 @@ def main(args, config):
                     'epoch': epoch,
                 }
         
-        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "custom"), exist_ok=True)
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", dataset_name ,"custom/", 'checkpoint_%02d.pth'%epoch))  
+        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "custom"), exist_ok=True)
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "custom", 'checkpoint_%02d.pth' % epoch))  
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, None, model_type=0)
 
 if __name__ == "__main__" : 

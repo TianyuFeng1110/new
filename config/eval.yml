@@ -5,8 +5,8 @@ model_type: 1                # 0: custom, 1: custom + prototype (gate fusion), 2
 features_path: /archive/hot5/fty/
 checkpoint_path: /archive/hot5/fty/checkpoints/
 
-checkpoint_custom: checkpoint_42.pth # TALE 42 CAFA3 39
-checkpoint_proto: checkpoint_68.pth # TALE 68 CAFA3 92
+checkpoint_custom: checkpoint_46.pth # CC：【TALE 42 CAFA3 39】MF：【TALE 46 CAFA3 46】BP：【TALE 44 CAFA3 48】
+checkpoint_proto: checkpoint_95.pth # CC：【TALE 68 CAFA3 92】MF：【TALE 95 CAFA3 94】BP：【TALE 22 CAFA3 30】
 
 dataset: TALE
 datasets_path: './data_tale/'
@@ -16,4 +16,7 @@ alpha: 50                     # smooth_tau
 lambda: 30                    # IC 衰减权重
 beta: 2                       # △IC 衰减速率
 
+namespace: MF
 queue_size: 50
+
+zero_shot: True
