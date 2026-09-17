@@ -3,6 +3,7 @@ import os
 import sys
 import torch
 import numpy as np
+import json
 from ruamel.yaml import YAML
 from torch.utils.data import DataLoader, SequentialSampler
 
@@ -83,7 +84,7 @@ def main(args, config):
         # ---- 门控融合: MLP + PrototypeNet ----
         from models.model import Model
         from models.custom_model import Model as CustomModel
-        from models.test_model import PrototypeNet
+        from models.prototype_model import PrototypeNet
 
         # 原型网络所需的层次结构数据
         go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
@@ -127,7 +128,7 @@ def main(args, config):
 
     elif model_type == 2:
         # ---- 纯 PrototypeNet ----
-        from models.test_model import PrototypeNet
+        from models.prototype_model import PrototypeNet
 
         go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))   
         parents_matrix, _ = utils.get_go_adjacency_matrices(go2id)
@@ -171,36 +172,27 @@ def main(args, config):
     #                           评估
     # =========================================================
 
-    # 罕见功能/尾部标签泛化实验
-    # utils.eval_func_generalizability(model, test_loader, device, go_freq, prototypes, model_type)
-    # 低相似度序列泛化实验
-    # msi_cache_path = os.path.join(datasets_path, f'msi_values_{namespace.lower()}.npy')
-    # utils.eval_msi_generalizability(model, test_loader, device, test_seq_data, prototypes, model_type, cache_path=msi_cache_path)
-
-    # 零样本类别评估（训练正样本数=0），分别以 model_type=0/1/2 运行可对比三个模型
-    # utils.eval_zero_shot_classes(model, test_loader, device, class_counts, prototypes, model_type)
-
     # 零样本 top-k 注释评估（TALE 原文 Supp. Tables S18/S23/S28 协议，零样本类内 top-k）
-    # utils.eval_zero_shot_topk(model, test_loader, device, class_counts, prototypes, model_type, max_k=10)
+    utils.eval_zero_shot_topk(model, test_loader, device, class_counts, prototypes, model_type, max_k=10)
 
-    # 实验 1: 按训练正样本数分桶的三模型对比（门控决策 vs 各桶实际更强模块）
-    # utils.eval_count_bucket_comparison(model, test_loader, device, prototypes, class_counts, model_type=model_type)
+    # 按训练正样本数分桶
+    utils.eval_count_bucket_comparison(model, test_loader, device, prototypes, class_counts, model_type=model_type)
+
     if model_type == 1 and prototypes is not None:
-        # 实验 2: τ_g 敏感性扫描（整体 Fmax 高原 + 零样本线严格水平）
-        # utils.eval_tau_g_sensitivity(model, test_loader, device, prototypes, class_counts)
-        # 实验 4: 零样本类的祖先溯源（机制解释：原型如何从祖先借力）
-        # utils.eval_zero_shot_ancestry(model.proto_model, hop_counts, class_counts, go2id)
+
+        # τ_g 敏感性扫描
+        utils.eval_tau_g_sensitivity(model, test_loader, device, prototypes, class_counts)
+
+        # 零样本类的祖先溯源（机制解释：原型如何从祖先借力）
+        utils.eval_zero_shot_ancestry(model.proto_model, hop_counts, class_counts, go2id)
+
         # 可解释性: 层级违反率（MLP vs Proto vs 融合 的 true-path 违反占比）
         utils.eval_hier_violation_rate(model, test_loader, device, prototypes,
                                        class_counts, hop_counts, model_type=1, eps=1e-4)
+        
         # 可解释性: 零样本案例研究（Proto 从祖先借力 → 命中 MLP 盲区的完整证据链）
-        case_records = utils.eval_zero_shot_case_study(model, test_loader, device, prototypes,
-                                                       class_counts, hop_counts, go2id,
-                                                       n_cases=3, top_anc=3,
-                                                       test_seq_data=test_seq_data,
-                                                       protein_id_key='ac')
-        # 保存案例记录供绘图脚本使用（plot_case_figure.py 读取，避免绘图时重跑推理）
-        import json
+        case_records = utils.eval_zero_shot_case_study(model, test_loader, device, prototypes, class_counts, hop_counts, go2id, n_cases=3, top_anc=3, test_seq_data=test_seq_data, protein_id_key='ac')
+        # 保存案例记录供绘图脚本使用（仅用于 plot_case_figure.py 读取，避免绘图时重跑推理）
         json_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tmp')
         os.makedirs(json_dir, exist_ok=True)
         json_path = os.path.join(json_dir, f'case_records_{dataset_name}_{namespace}.json')
@@ -208,68 +200,66 @@ def main(args, config):
             json.dump(case_records, f, ensure_ascii=False, indent=2)
         print(f"  案例记录已保存至 {json_path}")
 
-    # ---- 原型嵌入层级一致性分析（实验 1 / 2 / 4） ----
-    # 仅原型网络相关模型（model_type 1 / 2）有原型与层次结构数据
-    # if model_type in (1, 2) and prototypes is not None:
-    #     # 取原型网络本体（model_type 1 时原型网络是融合模型的子模块）
-    #     proto_net = model.proto_model if model_type == 1 else model
+    # 原型嵌入层级一致性分析，仅原型网络相关模型（model_type 1 / 2）有原型与层次结构数据
+    if model_type in (1, 2) and prototypes is not None:
+        # 取原型网络本体（model_type 1 时原型网络是融合模型的子模块）
+        proto_net = model.proto_model if model_type == 1 else model
 
-    #     # 计算未平滑的纯均值原型，作为"平滑前"对照
-    #     with torch.no_grad():
-    #         proto_net.eval()
-    #         s_feats = proto_net.mlp(all_feats)                       # (N, D)
-    #         proto_mask = prototype_index.to(device).float()          # (N, C)
-    #         mean_feats = proto_mask.T @ s_feats                      # (C, D)
-    #         counts = proto_mask.sum(dim=0).clamp(min=1)              # (C,)
-    #         prototypes_mean = mean_feats / counts.unsqueeze(1)       # (C, D)
+        # 计算未平滑的纯均值原型，作为"平滑前"对照
+        with torch.no_grad():
+            proto_net.eval()
+            s_feats = proto_net.mlp(all_feats)                       # (N, D)
+            proto_mask = prototype_index.to(device).float()          # (N, C)
+            mean_feats = proto_mask.T @ s_feats                      # (C, D)
+            counts = proto_mask.sum(dim=0).clamp(min=1)              # (C,)
+            prototypes_mean = mean_feats / counts.unsqueeze(1)       # (C, D)
 
-    #     # ---- 协议分流：BP 类数巨大（~2万）走祖先闭包子图近似；CC/MF 走全图精确 ----
-    #     if namespace == 'BP':
-    #         # BP: 分层采样目标节点 + 祖先闭包，构成祖先闭合子图
-    #         S, target_mask = utils.sample_ancestor_closed_subgraph(
-    #             hop_counts, class_counts, n_target=800, seed=42)
-    #         S_cpu = torch.from_numpy(S)                    # CPU 索引（hop/ic/counts 在 CPU）
-    #         S_dev = S_cpu.to(device)                       # GPU 索引（prototypes 在 device）
+        # ---- 协议分流：BP 类数巨大（~2万）走祖先闭包子图近似；CC/MF 走全图精确 ----
+        if namespace == 'BP':
+            # BP: 分层采样目标节点 + 祖先闭包，构成祖先闭合子图
+            S, target_mask = utils.sample_ancestor_closed_subgraph(
+                hop_counts, class_counts, n_target=800, seed=42)
+            S_cpu = torch.from_numpy(S)                    # CPU 索引（hop/ic/counts 在 CPU）
+            S_dev = S_cpu.to(device)                       # GPU 索引（prototypes 在 device）
 
-    #         # 将全部相关量切片到子图（祖先闭合保证 DAG 距离/语义相似度精确）
-    #         hop_sub = hop_counts[S_cpu][:, S_cpu]
-    #         ic_sub = ic[S_cpu]
-    #         counts_sub = class_counts[S_cpu]
-    #         proto_stable_sub = prototypes[S_dev]
-    #         proto_mean_sub = prototypes_mean[S_dev]
-    #         target_mask_t = torch.from_numpy(target_mask)
+            # 将全部相关量切片到子图（祖先闭合保证 DAG 距离/语义相似度精确）
+            hop_sub = hop_counts[S_cpu][:, S_cpu]
+            ic_sub = ic[S_cpu]
+            counts_sub = class_counts[S_cpu]
+            proto_stable_sub = prototypes[S_dev]
+            proto_mean_sub = prototypes_mean[S_dev]
+            target_mask_t = torch.from_numpy(target_mask)
 
-    #         print(f"[BP 子图协议] |S|={len(S)}, 目标节点 {int(target_mask.sum())}")
+            print(f"[BP 子图协议] |S|={len(S)}, 目标节点 {int(target_mask.sum())}")
 
-    #         # 实验 1: Mantel 检验（子图全上三角，秩聚合加速）
-    #         utils.eval_prototype_mantel(
-    #             prototypes_stable=proto_stable_sub, prototypes_mean=proto_mean_sub,
-    #             hop_counts=hop_sub, permutations=999)
+            # Mantel 检验（子图全上三角，秩聚合加速）
+            utils.eval_prototype_mantel(
+                prototypes_stable=proto_stable_sub, prototypes_mean=proto_mean_sub,
+                hop_counts=hop_sub, permutations=999)
 
-    #         # 实验 2: 语义相似度相关（分箱仅统计目标节点）
-    #         utils.eval_prototype_semantic_similarity(
-    #             prototypes_stable=proto_stable_sub, prototypes_mean=proto_mean_sub,
-    #             hop_counts=hop_sub, ic=ic_sub, class_counts=counts_sub,
-    #             target_mask=target_mask_t)
+            # 语义相似度相关（分箱仅统计目标节点）
+            utils.eval_prototype_semantic_similarity(
+                prototypes_stable=proto_stable_sub, prototypes_mean=proto_mean_sub,
+                hop_counts=hop_sub, ic=ic_sub, class_counts=counts_sub,
+                target_mask=target_mask_t)
 
-    #         # 实验 4: kNN 谱系纯度（分箱仅统计目标节点）
-    #         utils.eval_prototype_knn_purity(
-    #             prototypes_stable=proto_stable_sub, prototypes_mean=proto_mean_sub,
-    #             hop_counts=hop_sub, class_counts=counts_sub, k=5, h=2,
-    #             target_mask=target_mask_t)
-    #     else:
-    #         # CC / MF: 全图精确计算（现有逻辑，不变）
-    #         # 实验 1: Mantel 检验（原型余弦距离 vs DAG 距离）
-    #         utils.eval_prototype_mantel(prototypes_stable=prototypes, prototypes_mean=prototypes_mean, hop_counts=hop_counts, permutations=999,)
+            # kNN 谱系纯度（分箱仅统计目标节点）
+            utils.eval_prototype_knn_purity(
+                prototypes_stable=proto_stable_sub, prototypes_mean=proto_mean_sub,
+                hop_counts=hop_sub, class_counts=counts_sub, k=5, h=2,
+                target_mask=target_mask_t)
+        else:
+            # CC / MF: 全图精确计算
+            # Mantel 检验（原型余弦距离 vs DAG 距离）
+            utils.eval_prototype_mantel(prototypes_stable=prototypes, prototypes_mean=prototypes_mean, hop_counts=hop_counts, permutations=999,)
 
-    #         # 实验 2: 语义相似度相关（原型余弦相似度 vs Resnik / Lin）
-    #         utils.eval_prototype_semantic_similarity(prototypes_stable=prototypes,prototypes_mean=prototypes_mean,hop_counts=hop_counts,ic=ic, class_counts=class_counts,)
+            # 语义相似度相关（原型余弦相似度 vs Resnik / Lin）
+            utils.eval_prototype_semantic_similarity(prototypes_stable=prototypes,prototypes_mean=prototypes_mean,hop_counts=hop_counts,ic=ic, class_counts=class_counts,)
 
-    #         # 实验 4: kNN 谱系纯度
-    #         utils.eval_prototype_knn_purity(prototypes_stable=prototypes, prototypes_mean=prototypes_mean, hop_counts=hop_counts, class_counts=class_counts, k=5, h=2,)
+            # kNN 谱系纯度
+            utils.eval_prototype_knn_purity(prototypes_stable=prototypes, prototypes_mean=prototypes_mean, hop_counts=hop_counts, class_counts=class_counts, k=5, h=2,)
 
     # =========================================================
-    pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Evaluate CC Model')

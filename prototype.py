@@ -6,7 +6,7 @@ import torch.optim as optim
 import numpy as np
 
 from ruamel.yaml import YAML
-from models.test_model import PrototypeNet
+from models.prototype_model import PrototypeNet
 from datasets.balanced_dataset import Dataset  # 保持索引对齐（不过滤空标签）
 from datasets.prototype_valid_collator import collator
 from datasets.prototype_sampler import PrototypeSampler
