@@ -103,9 +103,9 @@ def main(args, config):
         proto_w=proto_w, smooth_tau=alpha_).to(device)
 
     mlp_ckpt = torch.load(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "/custom/", "checkpoint_42.pth"), map_location=device)
-    mlp_model.load_state_dict(mlp_ckpt['model'])
+    mlp_model.load_state_dict(utils.extract_state_dict(mlp_ckpt))
     proto_ckpt = torch.load(os.path.join("/archive/hot5/fty/checkpoints/", dataset_name, "/prototype/", "checkpoint_75.pth"), map_location=device)
-    proto_model.load_state_dict(proto_ckpt['model'])
+    proto_model.load_state_dict(utils.extract_state_dict(proto_ckpt))
 
     mlp_model.eval()
     proto_model.eval()
@@ -115,8 +115,9 @@ def main(args, config):
     all_feats = torch.stack([protein_feats[k] for k in indices], dim=0).to(device)
     prototypes = proto_model._get_prototypes(all_feats, prototype_index.to(device))
 
-    # ---- 门控融合模型（sigma 在 __init__ 中由 go_freq 纯数学计算） ----
-    model = Model(mlp_model, proto_model, go_freq).to(device)
+    # ---- 门控融合模型（sigma = n/(n+tau_g)，由监督可用性计算） ----
+    tau_g = config.get('tau_g', 2.0)
+    model = Model(mlp_model, proto_model, class_counts, tau_g=tau_g).to(device)
 
     print('Evaluating with frequency-derived sigma...')
     evaluate(model, prototypes, loader, device, go_freq)

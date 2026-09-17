@@ -235,17 +235,13 @@ def main(args, config):
         torch.save(model.state_dict(), os.path.join(ckpt_dir, 'checkpoint_%02d.pth' % epoch))
         # utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes, model_type=2)
 
-        # 零样本 top-k 注释评估：零样本类内部 top-k，扫描 k=1..10
-        utils.eval_zero_shot_topk(model, valid_loader, device, class_counts, prototypes=prototypes, model_type=2, max_k=10)
-        # 门控分桶对比实验
-        utils.eval_count_bucket_comparison(model, valid_loader, device, prototypes, class_counts, model_type=2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Prototypical Network for Protein Function Prediction')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--config', type=str, default='./config/prototype.yml')
+    parser.add_argument('--config', type=str, default='./config/test.yml')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--resume', type=str, nargs='?', const='auto', default=None,
                         help='断点恢复：指定 checkpoint 路径；或仅写 --resume（不带值）自动选择目录下最新 checkpoint')
 

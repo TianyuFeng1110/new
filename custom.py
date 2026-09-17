@@ -107,6 +107,7 @@ def main(args, config):
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     is_zero_shot = config['zero_shot']
+    print('数据集:', dataset_name, 'namespace: ', namespace)
     num_classes =  np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
     features_path = os.path.join('/archive/hot5/fty/', dataset_name)
     train_seq_data = utils.load_data_from_pkl(os.path.join(datasets_path, f"train_seq_{namespace.lower()}"))
@@ -146,9 +147,32 @@ def main(args, config):
     # utils.print_loss_gradients(model, train_loader, parent_indices, child_indices, device)
     # hier_scale = utils.get_hier_scale(model, train_loader, parent_indices, child_indices, device) # 静态标定法缩放梯度
     scale = {'custom_scale': 1, 'hier_scale': 0}
-    
+
+    # ---- 检查点目录与断点恢复（仅恢复模型权重，不恢复 optimizer/scheduler 状态）----
+    ckpt_dir = os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "custom")
+    start_epoch = 0
+    if args.resume:
+        ckpt_path = args.resume
+        if ckpt_path == 'auto':  # 自动选择目录下修改时间最新的 checkpoint
+            ckpt_path = utils.find_latest_checkpoint(ckpt_dir)
+            if ckpt_path is None:
+                print('未找到可恢复的 checkpoint，从头开始训练')
+        if ckpt_path:
+            if not os.path.isfile(ckpt_path):
+                raise FileNotFoundError(f'恢复训练的 checkpoint 不存在: {ckpt_path}')
+            print(f'从 checkpoint 恢复: {ckpt_path}')
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(utils.extract_state_dict(ckpt))
+            del ckpt
+            resumed_epoch = utils.parse_checkpoint_epoch(ckpt_path)
+            start_epoch = (resumed_epoch + 1) if resumed_epoch is not None else 0
+            print(f'恢复成功，从 epoch {start_epoch} 继续训练')
+    if start_epoch >= epochs:
+        print(f'start_epoch={start_epoch} >= epochs={epochs}，无需训练。如需继续训练请增大 --epochs')
+        return
+
     print('start traing......')
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
 
         # 训练
         train(model, optimizer, train_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices)
@@ -158,17 +182,18 @@ def main(args, config):
         all_probs, all_labels = valid(model, valid_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices)
     
     # utils.draw_frequencies_AUPRC(torch.cat(all_probs, dim=0).numpy(), torch.cat(all_probs_averge, dim=0).numpy(), torch.cat(all_labels, dim=0).numpy(), valid_freq, save_path=result_path, namespace=namespace) # 训练结束绘制结果曲线图
-        save_obj = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(), 
-                    'config': config,
-                    'epoch': epoch,
-                }
-        
-        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "custom"), exist_ok=True)
-        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "custom", 'checkpoint_%02d.pth' % epoch))  
+        # 仅保存模型权重（每个 epoch 一个文件），节省磁盘；不再保存 optimizer/scheduler/config
+        os.makedirs(ckpt_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(ckpt_dir, 'checkpoint_%02d.pth' % epoch))
         utils.eval_func_generalizability(model, valid_loader, device, go_freq, None, model_type=0)
+
+        # ---- 每个 epoch 结束后的额外评估 ----
+        # 零样本 top-k 注释评估（TALE 协议）：零样本类内部 top-k，扫描 k=1..10
+        utils.eval_zero_shot_topk(model, valid_loader, device, class_counts,
+                                  prototypes=None, model_type=0, max_k=10)
+        # 门控分桶对比实验（实验 1）：纯 MLP（model_type=0），
+        # 预测逻辑与上方 valid() 完全一致（feats + indices + labels → final_probs）
+        utils.eval_count_bucket_comparison(model, valid_loader, device, None, class_counts, model_type=0)
 
 if __name__ == "__main__" : 
     parser = argparse.ArgumentParser(description='parser example')
@@ -177,6 +202,8 @@ if __name__ == "__main__" :
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--batch_size', type=int, default=1024, help='batch size')
     parser.add_argument('--epochs', type=int, default=50, help='epoch')
+    parser.add_argument('--resume', type=str, nargs='?', const='auto', default=None,
+                        help='断点恢复：指定 checkpoint 路径（仅保存模型权重）；或仅写 --resume（不带值）自动选择目录下最新 checkpoint')
     
     args = parser.parse_args()
 

@@ -1,5 +1,5 @@
 hidden_dim: 1024
-esm_dim: 640
+esm_dim: 1280
 warmup_epochs: 2
 base_lr: 1e-3
 

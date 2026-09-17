@@ -99,7 +99,7 @@ def main(args, config):
         # 此处传入的数据驱动初始值仅决定加载前的结构，不影响评估结果
         lambda_init, beta_init, tau_init = utils.compute_smooth_param_inits(hop_counts, ic, class_counts)
         tau_min = float(config.get('tau_min', 0.0))
-        tau_g = float(config.get('tau_g'))   # 门控半饱和超参数
+        tau_g = float(config.get('tau_g', 5.0))   # 门控半饱和超参数
 
         # 加载两个预训练子模型
         mlp_model = CustomModel(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes).to(device)
@@ -183,30 +183,14 @@ def main(args, config):
     # 零样本 top-k 注释评估（TALE 原文 Supp. Tables S18/S23/S28 协议，零样本类内 top-k）
     # utils.eval_zero_shot_topk(model, test_loader, device, class_counts, prototypes, model_type, max_k=10)
 
-    # 实验 1: 按训练正样本数分桶的三模型对比（门控决策 vs 各桶实际更强模块）
-    # utils.eval_count_bucket_comparison(model, test_loader, device, prototypes, class_counts, model_type=model_type)
+    # ---- 门控可解释性实验（仅 model_type=1 适用） ----
     if model_type == 1 and prototypes is not None:
+        # 实验 1: 按训练正样本数分桶的三模型对比（门控决策 vs 各桶实际更强模块）
+        utils.eval_count_bucket_comparison(model, test_loader, device, prototypes, class_counts)
         # 实验 2: τ_g 敏感性扫描（整体 Fmax 高原 + 零样本线严格水平）
-        # utils.eval_tau_g_sensitivity(model, test_loader, device, prototypes, class_counts)
+        utils.eval_tau_g_sensitivity(model, test_loader, device, prototypes, class_counts)
         # 实验 4: 零样本类的祖先溯源（机制解释：原型如何从祖先借力）
-        # utils.eval_zero_shot_ancestry(model.proto_model, hop_counts, class_counts, go2id)
-        # 可解释性: 层级违反率（MLP vs Proto vs 融合 的 true-path 违反占比）
-        utils.eval_hier_violation_rate(model, test_loader, device, prototypes,
-                                       class_counts, hop_counts, model_type=1, eps=1e-4)
-        # 可解释性: 零样本案例研究（Proto 从祖先借力 → 命中 MLP 盲区的完整证据链）
-        case_records = utils.eval_zero_shot_case_study(model, test_loader, device, prototypes,
-                                                       class_counts, hop_counts, go2id,
-                                                       n_cases=3, top_anc=3,
-                                                       test_seq_data=test_seq_data,
-                                                       protein_id_key='ac')
-        # 保存案例记录供绘图脚本使用（plot_case_figure.py 读取，避免绘图时重跑推理）
-        import json
-        json_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tmp')
-        os.makedirs(json_dir, exist_ok=True)
-        json_path = os.path.join(json_dir, f'case_records_{dataset_name}_{namespace}.json')
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(case_records, f, ensure_ascii=False, indent=2)
-        print(f"  案例记录已保存至 {json_path}")
+        utils.eval_zero_shot_ancestry(model.proto_model, hop_counts, class_counts, go2id)
 
     # ---- 原型嵌入层级一致性分析（实验 1 / 2 / 4） ----
     # 仅原型网络相关模型（model_type 1 / 2）有原型与层次结构数据

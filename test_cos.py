@@ -185,43 +185,9 @@ def main(args, config):
     optimizer = optim.AdamW(model.parameters(), lr=base_lr)
     # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
-    ckpt_dir = os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "prototype")
-
-    # ---- 断点恢复 ----
-    start_epoch = 0
-    if args.resume:
-        ckpt_path = args.resume
-        if ckpt_path == 'auto':  # 自动选择目录下修改时间最新的 checkpoint
-            # 注意：按 mtime 而非 epoch 编号选择，避免目录中残留其他轮次的
-            # 高编号 checkpoint（如旧一轮的 checkpoint_99）被误选
-            ckpts = [f for f in os.listdir(ckpt_dir)
-                     if f.startswith('checkpoint_') and f.endswith('.pth')] if os.path.isdir(ckpt_dir) else []
-            if ckpts:
-                latest = max(ckpts, key=lambda f: os.path.getmtime(os.path.join(ckpt_dir, f)))
-                ckpt_path = os.path.join(ckpt_dir, latest)
-            else:
-                print('未找到可恢复的 checkpoint，从头开始训练')
-                ckpt_path = None
-        if ckpt_path is not None:
-            if not os.path.isfile(ckpt_path):
-                raise FileNotFoundError(f'恢复训练的 checkpoint 不存在: {ckpt_path}')
-            print(f'从 checkpoint 恢复: {ckpt_path}')
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            model.load_state_dict(utils.extract_state_dict(ckpt))
-            if 'optimizer' in ckpt:  # 兼容仅保存模型权重的 checkpoint（无 optimizer 状态）
-                optimizer.load_state_dict(ckpt['optimizer'])
-            resumed_epoch = ckpt.get('epoch') if 'model' in ckpt else utils.parse_checkpoint_epoch(ckpt_path)
-            start_epoch = (int(resumed_epoch) + 1) if resumed_epoch is not None else 0
-            del ckpt
-            print(f'恢复成功，从 epoch {start_epoch} 继续训练')
-
-    if start_epoch >= epochs:
-        print(f'start_epoch={start_epoch} >= epochs={epochs}，无需训练。如需继续训练请增大 --epochs')
-        return
-
     print('start training......')
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(epochs):
         # 训练
         train(model, optimizer, train_loader, epoch, device)
         # scheduler.step()
@@ -230,24 +196,24 @@ def main(args, config):
         prototypes = model._get_prototypes(all_feats, prototype_index.to(device))
         all_probs, all_labels = valid(model, prototypes, valid_loader, epoch, device)
 
-        # 仅保存模型权重（每个 epoch 一个文件），节省磁盘；不再保存 optimizer/scheduler/config
-        os.makedirs(ckpt_dir, exist_ok=True)
-        torch.save(model.state_dict(), os.path.join(ckpt_dir, 'checkpoint_%02d.pth' % epoch))
-        # utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes, model_type=2)
+        save_obj = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            # 'scheduler': scheduler.state_dict(),
+            'config': config,
+            'epoch': epoch,
+        }
+        os.makedirs(os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "prototype"), exist_ok=True)
+        torch.save(save_obj, os.path.join("/archive/hot5/fty/checkpoints/", namespace, dataset_name, "prototype", 'checkpoint_%02d.pth' % epoch))
+        utils.eval_func_generalizability(model, valid_loader, device, go_freq, prototypes, model_type=2)
 
-        # 零样本 top-k 注释评估：零样本类内部 top-k，扫描 k=1..10
-        utils.eval_zero_shot_topk(model, valid_loader, device, class_counts, prototypes=prototypes, model_type=2, max_k=10)
-        # 门控分桶对比实验
-        utils.eval_count_bucket_comparison(model, valid_loader, device, prototypes, class_counts, model_type=2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Prototypical Network for Protein Function Prediction')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--config', type=str, default='./config/prototype.yml')
+    parser.add_argument('--config', type=str, default='./config/test.yml')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--resume', type=str, nargs='?', const='auto', default=None,
-                        help='断点恢复：指定 checkpoint 路径；或仅写 --resume（不带值）自动选择目录下最新 checkpoint')
+    parser.add_argument('--epochs', type=int, default=150)
 
     args = parser.parse_args()
 

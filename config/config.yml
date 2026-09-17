@@ -1,5 +1,5 @@
 hidden_dim: 1024
-esm_dim: 640
+esm_dim: 1280
 base_lr: 5e-4
 
 # 原型网络参数
@@ -10,6 +10,9 @@ n_support: 50                  # 每个 GO term 的支持蛋白质数（用于�
 alpha: 50
 lambda: 30
 beta: 2                       # 用来控制△IC衰减的速率
+
+# 门控超参：sigma = n/(n+tau_g)，n 为训练正样本数
+tau_g: 2.0                    # 半饱和常数：n=tau_g 时 sigma=0.5，越小越接近硬门控
 
 dataset: CAFA3
 datasets_path: './data_tale/'

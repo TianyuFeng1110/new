@@ -6,20 +6,22 @@ import torch.nn.functional as F
 class Model(nn.Module):
     """门控融合：冻结的 MLP 分类头 + 冻结的原型网络。
 
-    sigma = pow((log_freq - min_log) / (max_log - min_log), power)
-        - 对 GO term 频率做 log 变换后 min-max 归一化到 [0, 1]
-        - 幂指数 power > 1 时压缩中低频 sigma → 更激进地压制 MLP 贡献
-        - power=1 退化为线性 min-max；power=3 为推荐值
-        - power 越大，低频功能越依赖 ProtoNet，高频功能仍保持 MLP 主导
+    sigma = n / (n + tau_g)，n 为类别在训练集中的正样本数：
+        - n = 0（零样本类）: sigma = 0，完全信任原型网络
+          （MLP 对无监督类结构性失明，原型网络经祖先平滑仍可预测）
+        - n >= 1（已见类）: sigma 随 n 迅速饱和到 1，信任 MLP
+          （实验表明已见类全频段 MLP 均不弱于原型网络）
+        - tau_g 为半饱和超参数：n = tau_g 时 sigma = 0.5，
+          控制"监督可用性"边界的软硬程度（tau_g 越小越接近硬门控）
 
     final_probs = sigma * mlp_probs + (1 - sigma) * proto_probs
-    高频功能 sigma→1（MLP 主导），低频功能 sigma→0（原型网络主导）。
+    门控按"监督是否存在"分工，而非频率连续谱。
     """
 
-    def __init__(self, mlp_model, proto_model, go_freq, power=2):
+    def __init__(self, mlp_model, proto_model, class_counts, tau_g=2.0, eps=1e-8):
         super().__init__()
-        self.num_classes = go_freq.shape[0]
-        self.power = power
+        self.num_classes = class_counts.shape[0]
+        self.tau_g = tau_g
 
         # 两个预训练模型，冻结不参与训练
         self.mlp_model = mlp_model
@@ -29,16 +31,11 @@ class Model(nn.Module):
         for p in self.proto_model.parameters():
             p.requires_grad = False
 
-        # ---- 纯数学计算 sigma：log-频率 min-max 归一化 + 幂压缩 ----
-        log_freq = torch.log(go_freq + 1e-8)
-        min_log = log_freq.min()
-        max_log = log_freq.max()
-        sigma_raw = (log_freq - min_log) / (max_log - min_log).clamp(min=1e-8)
-        sigma = sigma_raw ** power   # 幂压缩：低频 sigma 被大幅压低
+        # ---- 监督可用性门控：sigma = n / (n + tau_g) ----
+        n = class_counts.float()
+        sigma = n / (n + tau_g + eps)   # n=0 → 0（信 Proto）；n 增大 → 1（信 MLP）,eps防止除0
 
         self.register_buffer('sigma', sigma)
-        self.register_buffer('sigma_raw', sigma_raw)
-        self.register_buffer('log_freq', log_freq)
 
     def train(self, mode=True):
         super().train(mode)
@@ -60,8 +57,5 @@ class Model(nn.Module):
         # 门控融合（sigma 固定，无梯度）
         final_probs = self.sigma * custom_probs + (1.0 - self.sigma) * proto_probs
 
-        logits = torch.logit(final_probs, eps=1e-6)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
-
-        return final_probs, loss, self.sigma, torch.tensor(0.0), torch.tensor(0.0)
+        return final_probs, self.sigma
 

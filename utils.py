@@ -149,6 +149,42 @@ def load_data_from_pkl(file_path):
     with open(file_path, 'rb') as f:
         return pickle.load(f)
 
+
+def extract_state_dict(ckpt):
+    """从 checkpoint 中提取模型 state_dict。
+
+    兼容两种格式：
+    - 旧格式（完整检查点）：{'model': ..., 'optimizer': ..., 'epoch': ..., 'config': ...}
+    - 新格式（仅模型权重）：裸的 model.state_dict()
+    """
+    if isinstance(ckpt, dict) and 'model' in ckpt:
+        return ckpt['model']
+    return ckpt
+
+
+def find_latest_checkpoint(ckpt_dir, prefix='checkpoint_', suffix='.pth'):
+    """返回目录中修改时间最新的 checkpoint 文件绝对路径；目录不存在或无匹配文件时返回 None。
+
+    按 mtime 而非 epoch 编号选择，避免目录中残留其他轮次的高编号 checkpoint 被误选。
+    """
+    if not os.path.isdir(ckpt_dir):
+        return None
+    ckpts = [f for f in os.listdir(ckpt_dir)
+             if f.startswith(prefix) and f.endswith(suffix)]
+    if not ckpts:
+        return None
+    latest = max(ckpts, key=lambda f: os.path.getmtime(os.path.join(ckpt_dir, f)))
+    return os.path.join(ckpt_dir, latest)
+
+
+def parse_checkpoint_epoch(path, prefix='checkpoint_', suffix='.pth'):
+    """从 checkpoint 文件名解析 epoch 编号（如 checkpoint_05.pth -> 5）；解析失败返回 None。"""
+    import re
+    fname = os.path.basename(path)
+    m = re.match(r'^{}(\d+){}$'.format(re.escape(prefix), re.escape(suffix)), fname)
+    return int(m.group(1)) if m else None
+
+
 class MetricLogger(object):
     def __init__(self, delimiter="\t"):
         self.meters = defaultdict(SmoothedValue)
@@ -1463,6 +1499,132 @@ def eval_func_generalizability(model, test_loader, device, go_freq, prototypes=N
           f"micro_AUPRC={metrics_all['micro_AUPRC']:.4f}")
 
 
+def eval_msi_generalizability(model, test_loader, device, test_seq_data,
+                              prototypes=None, model_type=None, cache_path=None):
+    """按最大序列一致性（MSI）划分测试蛋白，评估不同序列相似度区间上的泛化能力。
+
+    MSI 定义：测试蛋白与测试集中其他所有蛋白的最大序列一致性（通过全局比对计算）。
+    区间划分：[0%, 20%], (20%, 30%], (30%, 40%], (40%, 100%]
+
+    Args:
+        model:          待评估模型
+        test_loader:    测试集 DataLoader
+        device:         torch device
+        test_seq_data:  测试集序列数据 (list of dict, 每个 dict 含 'seq' 字段)
+        prototypes:     预计算的原型 (可选)
+        model_type:     模型类型
+        cache_path:     MSI 缓存文件路径 (.npy)，若存在则直接加载，否则计算后保存
+    """
+    from Bio.Align import PairwiseAligner, substitution_matrices
+
+    print("Starting MSI-based evaluation...")
+
+    # 1. 收集所有预测概率和真实标签
+    all_probs = []
+    all_labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch_feats, labels, indices in test_loader:
+            batch_feats = batch_feats.to(device)
+            labels = labels.to(device)
+            indices = indices.to(device)
+
+            if prototypes is not None:
+                if model_type == 2:
+                    res = model(batch_feats, labels, None, None, prototypes)
+                    final_probs = torch.sigmoid(res[0])
+                else:
+                    res = model(batch_feats, prototypes, labels)
+                    final_probs = res[0]
+            else:
+                res = model(batch_feats, indices, labels)
+                final_probs = res[0]
+
+            all_probs.append(final_probs.cpu())
+            all_labels.append(labels.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0).numpy()
+    all_labels = torch.cat(all_labels, dim=0).numpy()
+
+    # 2. 计算每个测试蛋白的 MSI（与测试集中其他蛋白的最大序列一致性）
+    #    若 cache_path 存在则直接加载缓存，否则计算后保存
+    n_test = len(test_seq_data)
+    if cache_path is not None and os.path.exists(cache_path):
+        print(f"  Loading cached MSI values from {cache_path}")
+        msi_values = np.load(cache_path)
+        if msi_values.shape[0] != n_test:
+            raise ValueError(
+                f"MSI cache size mismatch: cached {msi_values.shape[0]} vs current {n_test} test proteins")
+    else:
+        blosum62_alphabet = set("ARNDCQEGHILKMFPSTWYV")
+
+        def sanitize_seq(seq):
+            """过滤掉 BLOSUM62 字母表之外的非标准氨基酸字符"""
+            return ''.join(c for c in seq.upper() if c in blosum62_alphabet)
+
+        test_seqs = [sanitize_seq(item['seq']) for item in test_seq_data]
+
+        aligner = PairwiseAligner()
+        aligner.mode = 'global'
+        aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+        aligner.open_gap_score = -10
+        aligner.extend_gap_score = -0.5
+
+        print(f"  Computing MSI for {n_test} test proteins (test-vs-test)...")
+        msi_values = np.zeros(n_test)
+        for i in range(n_test):
+            max_identity = 0.0
+            for j in range(n_test):
+                if i == j:
+                    continue
+                alignments = aligner.align(test_seqs[i], test_seqs[j])
+                if len(alignments) > 0:
+                    aligned1 = str(alignments[0][0])
+                    aligned2 = str(alignments[0][1])
+                    matches = sum(1 for a, b in zip(aligned1, aligned2) if a == b and a != '-')
+                    identity = matches / len(aligned1) if len(aligned1) > 0 else 0.0
+                    max_identity = max(max_identity, identity)
+            msi_values[i] = max_identity
+            if (i + 1) % 50 == 0:
+                print(f"    Processed {i + 1}/{n_test} test proteins")
+
+        if cache_path is not None:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True) if os.path.dirname(cache_path) else None
+            np.save(cache_path, msi_values)
+            print(f"  Saved MSI values to {cache_path}")
+
+    # 3. 按 MSI 区间划分，计算各区间的 Fmax 和 micro AUPRC
+    bins = [
+        (0.0, 0.2, "[0%, 20%]"),
+        (0.2, 0.3, "(20%, 30%]"),
+        (0.3, 0.4, "(30%, 40%]"),
+        (0.4, 1.0, "(40%, 100%]"),
+    ]
+
+    print("\n===== MSI-based Evaluation =====")
+    for low, high, bin_label in bins:
+        if low == 0.0:
+            mask = (msi_values >= low) & (msi_values <= high)
+        else:
+            mask = (msi_values > low) & (msi_values <= high)
+
+        n_proteins = mask.sum()
+        if n_proteins == 0:
+            print(f"  MSI {bin_label}: No proteins in this bin")
+            continue
+
+        bin_probs = all_probs[mask]
+        bin_labels = all_labels[mask]
+        metrics = calculate_metrics(bin_labels, bin_probs)
+        print(f"  MSI {bin_label}: n={n_proteins}, "
+              f"Fmax={metrics['Fmax']:.4f}, micro_AUPRC={metrics['micro_AUPRC']:.4f}")
+
+    metrics_all = calculate_metrics(all_labels, all_probs)
+    print(f"\n  Overall: Fmax={metrics_all['Fmax']:.4f}, "
+          f"micro_AUPRC={metrics_all['micro_AUPRC']:.4f}")
+
+
 def eval_term_freq_generalizability(model, test_loader, device, go_freq, prototypes=None):
     """按 GO term 自身的功能频率划分频率桶，评估模型在不同频率桶上的泛化能力。
 
@@ -1541,6 +1703,774 @@ def eval_term_freq_generalizability(model, test_loader, device, go_freq, prototy
     print(f"\n  Overall: Fmax={metrics_all['Fmax']:.4f}, "
           f"micro_AUPRC={metrics_all['micro_AUPRC']:.4f}")
 
+
+def eval_zero_shot_classes(model, test_loader, device, class_counts,
+                           prototypes=None, model_type=None):
+    """仅评估训练集中正样本数为 0 的类别（零样本类别）。
+
+    这类类别在训练时没有任何直接监督信号:
+    - MLP 对应的分类器行只收到过负梯度，结构性地倾向输出低概率（盲区）；
+    - 原型网络经祖先平滑（w = n/(n+τ)，n=0 时原型完全由祖先加权而来）仍可预测。
+    本实验用于验证原型网络在零样本场景下的不可替代性。
+    分别以 model_type=0/1/2 运行 test_eval.py 即可对比三个模型。
+
+    Args:
+        model:        待评估模型（支持 model_type 0/1/2）
+        test_loader:  测试集 DataLoader，返回 (batch_feats, labels, indices)
+        device:       torch device
+        class_counts: Tensor (num_classes,)，每个类在训练集中的正样本数
+        prototypes:   预计算原型（model_type 1/2 必需）
+        model_type:   0=MLP, 1=门控融合, 2=原型网络
+    """
+    print("Starting zero-shot class evaluation (训练正样本数=0)...")
+
+    # 1. 收集所有预测概率和真实标签
+    all_probs = []
+    all_labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch_feats, labels, indices in test_loader:
+            batch_feats = batch_feats.to(device)
+            labels = labels.to(device)
+            indices = indices.to(device)
+
+            if prototypes is not None:
+                if model_type == 2:
+                    res = model(batch_feats, labels, None, None, prototypes)
+                    final_probs = torch.sigmoid(res[0])  # 原型网络返回 logits，需 sigmoid
+                else:
+                    res = model(batch_feats, prototypes, labels)
+                    final_probs = res[0]
+            else:
+                res = model(batch_feats, indices, labels)
+                final_probs = res[0]
+
+            all_probs.append(final_probs.cpu())
+            all_labels.append(labels.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0).numpy()    # (N, num_classes)
+    all_labels = torch.cat(all_labels, dim=0).numpy()  # (N, num_classes)
+
+    # 2. 列切片：只保留训练正样本数为 0 的类别
+    counts_np = class_counts.cpu().numpy()
+    zs_cols = np.where(counts_np == 0)[0]
+
+    print("=" * 70)
+    print(f"[零样本评估] 训练正样本数=0 的类别: {len(zs_cols)} / {len(counts_np)}")
+    if len(zs_cols) == 0:
+        print("  不存在零样本类别，跳过")
+        return
+
+    zs_probs = all_probs[:, zs_cols]
+    zs_labels = all_labels[:, zs_cols]
+
+    n_test_pos = int(zs_labels.sum())
+    n_pos_classes = int((zs_labels.sum(axis=0) > 0).sum())
+    n_proteins = int((zs_labels.sum(axis=1) > 0).sum())
+    print(f"  测试集在零样本类上的正样本: {n_test_pos} "
+          f"(覆盖 {n_pos_classes} 个零样本类, 涉及 {n_proteins} 个蛋白质)")
+
+    if n_test_pos == 0:
+        print("  测试集中零样本类别无正样本，指标无定义，跳过")
+        return
+
+    # 3. 指标计算（calculate_metrics 内部会过滤无标签蛋白质）
+    metrics = calculate_metrics(zs_labels, zs_probs)
+    print(f"  Fmax={metrics['Fmax']:.4f}, micro_AUPRC={metrics['micro_AUPRC']:.4f}")
+    print(f"  macro_AUPRC={macro_auprc(zs_labels, zs_probs):.4f} "
+          f"(仅对测试集中有正样本的零样本类平均)")
+    print("=" * 70)
+
+
+def eval_zero_shot_topk(model, test_loader, device, class_counts,
+                        prototypes=None, model_type=None, max_k=10):
+    """零样本 top-k 注释评估（TALE 原文 Supp. Tables S18/S23/S28 协议）。
+
+    对训练正样本数为 0 的 GO term (f(i)=0)，为每个测试蛋白在**零样本类内部**
+    取得分最高的 top-k 个预测作为注释，在零样本类列上计算 Fmax。
+    扫描 k = 1..max_k，报告每个 k 下的 Fmax / micro_AUPRC。
+
+    top-k 是基于排序的注释方案，不依赖模型输出的绝对概率校准
+    （原型网络退化的频率先验 bias 不再压制 Fmax），
+    因此可与 TALE 基线公平对比。
+
+    Args:
+        model:        待评估模型（支持 model_type 0/1/2）
+        test_loader:  测试集 DataLoader，返回 (batch_feats, labels, indices)
+        device:       torch device
+        class_counts: Tensor (num_classes,)，每个类在训练集中的正样本数
+        prototypes:   预计算原型（model_type 1/2 必需）
+        model_type:   0=MLP, 1=门控融合, 2=原型网络
+        max_k:        扫描的 top-k 上限（默认 10）
+    Returns:
+        dict: {k: {'Fmax': float, 'micro_AUPRC': float}}
+    """
+    print("Starting zero-shot top-k evaluation (TALE protocol)...")
+
+    # 1. 收集所有预测概率和真实标签
+    all_probs = []
+    all_labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch_feats, labels, indices in test_loader:
+            batch_feats = batch_feats.to(device)
+            labels = labels.to(device)
+            indices = indices.to(device)
+
+            if prototypes is not None:
+                if model_type == 2:
+                    res = model(batch_feats, labels, None, None, prototypes)
+                    final_probs = torch.sigmoid(res[0])  # 原型网络返回 logits，需 sigmoid
+                else:
+                    res = model(batch_feats, prototypes, labels)
+                    final_probs = res[0]
+            else:
+                res = model(batch_feats, indices, labels)
+                final_probs = res[0]
+
+            all_probs.append(final_probs.cpu())
+            all_labels.append(labels.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0).numpy()    # (N, num_classes)
+    all_labels = torch.cat(all_labels, dim=0).numpy()  # (N, num_classes)
+
+    # 2. 列切片：只保留训练正样本数为 0 的类别
+    counts_np = class_counts.cpu().numpy()
+    zs_cols = np.where(counts_np == 0)[0]
+    n_zs = len(zs_cols)
+
+    print("=" * 70)
+    print(f"[零样本 top-k] 零样本类: {n_zs} / {len(counts_np)}")
+    if n_zs == 0:
+        print("  不存在零样本类别，跳过")
+        return {}
+
+    zs_probs = all_probs[:, zs_cols]
+    zs_labels = all_labels[:, zs_cols]
+    n_test_pos = int(zs_labels.sum())
+    if n_test_pos == 0:
+        print("  测试集中零样本类别无正样本，指标无定义，跳过")
+        return {}
+    print(f"  测试集零样本正样本: {n_test_pos} "
+          f"(覆盖 {int((zs_labels.sum(axis=0) > 0).sum())} 个零样本类)")
+
+    # 3. 扫描 k：零样本类内取 top-k，构建二值预测矩阵后计算 Fmax
+    print(f"  {'k':>3} | {'Fmax':>8} | {'micro_AUPRC':>11}")
+    print(f"  {'-' * 30}")
+    results = {}
+    first_k_over_01 = None
+    for k in range(1, min(max_k, n_zs) + 1):
+        topk_idx = np.argsort(-zs_probs, axis=1)[:, :k]     # (N, k) 零样本类内 top-k
+        preds = np.zeros_like(zs_labels)
+        preds[np.arange(len(zs_labels))[:, None], topk_idx] = 1.0
+
+        metrics = calculate_metrics(zs_labels, preds)       # 内部过滤无标签蛋白质
+        results[k] = metrics
+        print(f"  {k:>3} | {metrics['Fmax']:>8.4f} | {metrics['micro_AUPRC']:>11.4f}")
+        if first_k_over_01 is None and metrics['Fmax'] > 0.1:
+            first_k_over_01 = k
+
+    if first_k_over_01 is not None:
+        print(f"  → top-{first_k_over_01} 起 Fmax 超过 0.1")
+    else:
+        print(f"  → k≤{min(max_k, n_zs)} 内 Fmax 均未超过 0.1")
+    print("=" * 70)
+
+    return results
+
+
+# ============================================================
+#  门控可解释性实验（实验 1 / 2 / 4）
+#  命题：soft 门控 sigma = n/(n+tau_g) 按"监督是否存在"分工，
+#  且该分工对每个区域都是最优选择。
+# ============================================================
+
+def _collect_gate_probs(model, test_loader, device, prototypes):
+    """一次前向收集 MLP / Proto 两个子模块的概率矩阵（门控可解释性实验共用）。
+
+    门控融合模型的两个子模块均冻结，sigma 只是对这两份概率的逐类加权，
+    因此实验 1 / 2 可在同一份概率矩阵上复用，无需各自重复前向。
+
+    Args:
+        model:       门控融合模型（含 .mlp_model / .proto_model）
+        test_loader: 测试集 DataLoader，返回 (batch_feats, labels, indices)
+        device:      torch device
+        prototypes:  预计算原型 (num_classes, hidden_dim)
+    Returns:
+        (mlp_probs, proto_probs, all_labels): 均为 (N, num_classes) numpy 数组
+    """
+    model.eval()
+    mlp_list, proto_list, label_list = [], [], []
+    with torch.no_grad():
+        for batch_feats, labels, indices in test_loader:
+            batch_feats = batch_feats.to(device)
+            labels = labels.to(device)
+
+            _, custom_logits, _ = model.mlp_model(batch_feats, None, labels)
+            mlp_probs = torch.sigmoid(custom_logits)
+            q_feats = model.proto_model.mlp(batch_feats)
+            proto_logits = model.proto_model.predict(q_feats, prototypes)
+            proto_probs = torch.sigmoid(proto_logits)
+
+            mlp_list.append(mlp_probs.cpu())
+            proto_list.append(proto_probs.cpu())
+            label_list.append(labels.cpu())
+
+    return (torch.cat(mlp_list, dim=0).numpy(),
+            torch.cat(proto_list, dim=0).numpy(),
+            torch.cat(label_list, dim=0).numpy())
+
+
+def _collect_proto_probs(model, test_loader, device, prototypes):
+    """纯原型网络（model_type=2）的概率收集。
+
+    预测方式与 prototype.py 的 valid() 完全一致：
+        logits, loss, temp = model(query=feats, labels=labels, prototypes=prototypes)
+        probs = sigmoid(logits)
+
+    Args:
+        model:       纯原型网络（model_type=2）
+        test_loader: 测试集 DataLoader，返回 (batch_feats, labels, indices)
+        device:      torch device
+        prototypes:  预计算原型 (num_classes, hidden_dim)
+    Returns:
+        (proto_probs, all_labels): 均为 (N, num_classes) numpy 数组
+    """
+    model.eval()
+    proto_list, label_list = [], []
+    with torch.no_grad():
+        for batch_feats, labels, _ in test_loader:
+            logits, _, _ = model(query=batch_feats.to(device), labels=labels.to(device),
+                                 prototypes=prototypes.to(device))
+            proto_list.append(torch.sigmoid(logits).cpu())
+            label_list.append(labels.cpu())
+
+    return (torch.cat(proto_list, dim=0).numpy(),
+            torch.cat(label_list, dim=0).numpy())
+
+
+def _collect_mlp_probs(model, test_loader, device):
+    """纯 MLP 模型（model_type=0）的概率收集。
+
+    预测方式与 custom.py 的 valid() 完全一致：
+        final_probs, custom_logits, custom_loss = model(feats, indices, labels)
+
+    Args:
+        model:       纯 MLP 模型（model_type=0，如 models/custom_model.Model）
+        test_loader: 测试集 DataLoader，返回 (batch_feats, labels, indices)
+        device:      torch device
+    Returns:
+        (mlp_probs, all_labels): 均为 (N, num_classes) numpy 数组
+    """
+    model.eval()
+    mlp_list, label_list = [], []
+    with torch.no_grad():
+        for batch_feats, labels, indices in test_loader:
+            final_probs, _, _ = model(batch_feats.to(device), indices.to(device), labels.to(device))
+            mlp_list.append(final_probs.cpu())
+            label_list.append(labels.cpu())
+
+    return (torch.cat(mlp_list, dim=0).numpy(),
+            torch.cat(label_list, dim=0).numpy())
+
+
+def _topk_fmax(y, probs, k=1):
+    """在给定列上按 top-k 注释协议计算 Fmax（基于排序，不依赖绝对概率校准）。"""
+    idx = np.argsort(-probs, axis=1)[:, :k]
+    preds = np.zeros_like(y)
+    preds[np.arange(len(y))[:, None], idx] = 1.0
+    return calculate_metrics(y, preds)['Fmax']
+
+
+def eval_count_bucket_comparison(model, test_loader, device, prototypes, class_counts, model_type=None):
+    """实验 1: 按训练正样本数分桶的三模型对比。
+
+    按类别在训练集中的正样本数 n 分桶，每桶报告门控值 σ 与
+    MLP / Proto / 融合三者的 Fmax，验证"门控决策与该桶内实际更强的模块对齐"：
+      - n=0 桶: Proto 应显著更强（用零样本 top-1 协议报告，
+        因阈值 Fmax 会被原型网络退化的频率先验 bias 压为 0）；
+      - n≥1 桶: MLP 应不弱于 Proto，融合 ≈ MLP（门控把权重交给 MLP）。
+
+    Args:
+        model:        门控融合模型（model_type=1）、纯 MLP（model_type=0）或纯原型网络（model_type=2）
+        test_loader:  测试集 DataLoader
+        device:       torch device
+        prototypes:   预计算原型（model_type=0 不需要，传 None 即可）
+        class_counts: Tensor (num_classes,)，每个类在训练集中的正样本数
+        model_type:   None/1=门控融合模型（报告 MLP/Proto/融合 三列）；
+                      0=纯 MLP（仅报告 MLP 列，预测逻辑与 custom.py valid() 完全一致）；
+                      2=纯原型网络（仅报告 Proto 列，预测逻辑与 prototype.py valid() 完全一致）
+    """
+    if model_type == 2:
+        # 纯原型网络：预测逻辑与 prototype.py 的 valid() 完全一致
+        proto_probs, all_labels = _collect_proto_probs(model, test_loader, device, prototypes)
+        mlp_probs = None
+        sigma = None
+        model_desc = "纯原型网络(model_type=2)"
+    elif model_type == 1 or model_type is None:
+        # 门控融合模型：分解 MLP / Proto 两份概率及门控 σ
+        mlp_probs, proto_probs, all_labels = _collect_gate_probs(model, test_loader, device, prototypes)
+        sigma = model.sigma.detach().cpu().numpy().astype(np.float64)
+        model_desc = f"门控融合(model_type=1), tau_g={model.tau_g:g}"
+    else:
+        # 纯 MLP（model_type=0）：预测逻辑与 custom.py 的 valid() 完全一致
+        mlp_probs, all_labels = _collect_mlp_probs(model, test_loader, device)
+        proto_probs = None
+        sigma = None
+        model_desc = "纯MLP(model_type=0)"
+
+    counts_np = class_counts.cpu().numpy().astype(np.float64)
+
+    buckets = [
+        ('n=0', 0, 0),
+        ('1-2', 1, 2),
+        ('3-10', 3, 10),
+        ('11-50', 11, 50),
+        ('>50', 51, np.inf),
+    ]
+
+    print("=" * 82)
+    print(f"[实验1 分桶对比] {model_desc}   "
+          f"(n=0 桶用零样本 top-1 协议，其余桶用阈值 Fmax)")
+    if model_type == 2:
+        print(f"{'桶':>7} | {'类别数':>6} | {'Proto':>8}")
+    elif model_type == 0:
+        print(f"{'桶':>7} | {'类别数':>6} | {'MLP':>8}")
+    else:
+        print(f"{'桶':>7} | {'类别数':>6} | {'平均σ':>7} | {'MLP':>8} | {'Proto':>8} | {'融合':>8}")
+    print("-" * 82)
+
+    for name, lo, hi in buckets:
+        cols = np.where((counts_np >= lo) & (counts_np <= hi))[0]
+        if len(cols) == 0:
+            if model_type in (0, 2):
+                print(f"{name:>7} | {0:>6} |    -")
+            else:
+                print(f"{name:>7} | {0:>6} |    -    |    -     |    -     |    -")
+            continue
+
+        y = all_labels[:, cols]
+        if int(y.sum()) == 0:
+            if model_type in (0, 2):
+                print(f"{name:>7} | {len(cols):>6} | (测试集无正样本)")
+            else:
+                print(f"{name:>7} | {len(cols):>6} | {sigma[cols].mean():>7.3f} | (测试集无正样本)")
+            continue
+
+        if model_type == 2:
+            p = proto_probs[:, cols]
+            # n=0 桶：top-1 协议（阈值 Fmax 受退化 bias 压制）；其余桶：阈值 Fmax
+            fp = _topk_fmax(y, p) if lo == 0 else calculate_metrics(y, p)['Fmax']
+            print(f"{name:>7} | {len(cols):>6} | {fp:>8.4f}")
+        elif model_type == 0:
+            m = mlp_probs[:, cols]
+            # n=0 桶：top-1 协议（与实验 1 各模型统一）；其余桶：阈值 Fmax
+            fm = _topk_fmax(y, m) if lo == 0 else calculate_metrics(y, m)['Fmax']
+            print(f"{name:>7} | {len(cols):>6} | {fm:>8.4f}")
+        else:
+            m = mlp_probs[:, cols]
+            p = proto_probs[:, cols]
+            f = sigma[None, cols] * m + (1.0 - sigma[None, cols]) * p
+            mean_sigma = sigma[cols].mean()
+            if lo == 0:  # n=0 桶：top-1 协议（阈值 Fmax 受退化 bias 压制）
+                fm, fp, ff = _topk_fmax(y, m), _topk_fmax(y, p), _topk_fmax(y, f)
+            else:
+                fm = calculate_metrics(y, m)['Fmax']
+                fp = calculate_metrics(y, p)['Fmax']
+                ff = calculate_metrics(y, f)['Fmax']
+
+            print(f"{name:>7} | {len(cols):>6} | {mean_sigma:>7.3f} | "
+                  f"{fm:>8.4f} | {fp:>8.4f} | {ff:>8.4f}")
+    print("=" * 82)
+
+
+def eval_tau_g_sensitivity(model, test_loader, device, prototypes, class_counts,
+                           tau_g_list=(0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)):
+    """实验 2: τ_g 敏感性扫描。
+
+    复用同一份 MLP/Proto 概率矩阵，仅改变门控公式 sigma = n/(n+τ_g)，
+    报告每个 τ_g 下的整体 Fmax 与零样本 top-1 Fmax。
+
+    预期:
+      - 零样本 top-1 线严格水平（n=0 时 σ=0 与 τ_g 无关，机制保证）；
+      - 整体 Fmax 在宽阔区间内形成高原。
+    二者共同证明门控捕捉的是"监督是否存在"的二元分界，而非调参巧合。
+
+    Args:
+        model:        门控融合模型（model_type=1）
+        test_loader:  测试集 DataLoader
+        device:       torch device
+        prototypes:   预计算原型
+        class_counts: Tensor (num_classes,)，每个类在训练集中的正样本数
+        tau_g_list:   待扫描的 τ_g 取值
+    """
+    mlp_probs, proto_probs, all_labels = _collect_gate_probs(model, test_loader, device, prototypes)
+    counts_np = class_counts.cpu().numpy().astype(np.float64)
+    zs_cols = np.where(counts_np == 0)[0]
+    zs_y = all_labels[:, zs_cols] if len(zs_cols) > 0 else None
+
+    print("=" * 58)
+    print("[实验2 τ_g 敏感性]")
+    print(f"{'τ_g':>6} | {'整体Fmax':>10} | {'零样本top-1 Fmax':>16}")
+    print("-" * 58)
+    for tg in tau_g_list:
+        sigma = counts_np / (counts_np + tg)
+        final = sigma[None, :] * mlp_probs + (1.0 - sigma[None, :]) * proto_probs
+        overall = calculate_metrics(all_labels, final)['Fmax']
+        if zs_y is not None and int(zs_y.sum()) > 0:
+            zs = _topk_fmax(zs_y, final[:, zs_cols], k=1)
+        else:
+            zs = float('nan')
+        print(f"{tg:>6g} | {overall:>10.4f} | {zs:>16.4f}")
+    print("=" * 58)
+
+
+def eval_zero_shot_ancestry(proto_net, hop_counts, class_counts, go2id, top_k=3):
+    """实验 4: 零样本类的祖先溯源（机制解释）。
+
+    对零样本类 (n=0)，_smooth_prototypes 中自身原型权重 w = n/(n+τ) = 0，
+    原型完全由祖先原型按 proto_w 加权平均而来。本实验报告每个零样本类的
+    原型由哪些祖先构成、权重如何分布，解释"Proto 为何能零样本预测"——
+    通过层级平滑从祖先借力。
+
+    Args:
+        proto_net:    PrototypeNet（model_type=1 时为 model.proto_model）
+        hop_counts:   Tensor (C, C)，祖先跳数矩阵
+        class_counts: Tensor (C,)，每个类的正样本数
+        go2id:        dict[GO_ID -> {'ind': int, 'father': [...], 'child': [...]}]
+        top_k:        每个零样本类打印的主要祖先数
+    """
+    proto_w = proto_net._compute_proto_w().detach().cpu().numpy().astype(np.float64)
+    counts_np = class_counts.cpu().numpy().astype(np.float64)
+    hop_np = hop_counts.cpu().numpy()
+    idx2go = {v['ind']: k for k, v in go2id.items() if isinstance(v, dict) and 'ind' in v}
+
+    zs_cols = np.where(counts_np == 0)[0]
+    lam, beta, tau = proto_net.get_smooth_params()
+    print("=" * 82)
+    print(f"[实验4 零样本祖先溯源] λ={lam:.2f}, β={beta:.2f}, τ={tau:.2f}, "
+          f"零样本类={len(zs_cols)}")
+    print("=" * 82)
+
+    top1_shares, eff_counts, dom_hops = [], [], []
+    for i in zs_cols:
+        anc_idx = np.where(hop_np[i] > 0)[0]
+        go_name = idx2go.get(int(i), f'idx{i}')
+        if len(anc_idx) == 0:
+            print(f"  {go_name}: 无祖先（根节点），原型回退为自身")
+            continue
+
+        w = proto_w[i, anc_idx]
+        w_sum = w.sum()
+        if w_sum <= 0:
+            print(f"  {go_name}: 祖先权重全为 0")
+            continue
+        w = w / w_sum
+        order = np.argsort(-w)
+
+        eff = 1.0 / (w ** 2).sum()                     # 有效祖先数
+        top1_shares.append(float(w[order[0]]))
+        eff_counts.append(float(eff))
+        dom_hops.append(float(hop_np[i, anc_idx[order[0]]]))
+
+        top_desc = ", ".join(
+            f"{idx2go.get(int(anc_idx[j]), int(anc_idx[j]))}"
+            f"(n={int(counts_np[anc_idx[j]])}, {w[order[j]]:.2f})"
+            for j in order[:top_k])
+        print(f"  {go_name}: 有效祖先={eff:.1f}, top-{top_k}: {top_desc}")
+
+    if top1_shares:
+        print("-" * 82)
+        print(f"  汇总: 平均top-1祖先权重占比={np.mean(top1_shares):.3f}, "
+              f"平均有效祖先数={np.mean(eff_counts):.1f}, "
+              f"主导祖先平均hop距离={np.mean(dom_hops):.2f}")
+    print("=" * 82)
+
+
+def eval_zero_shot_case_study(model, test_loader, device, prototypes,
+                              class_counts, hop_counts, go2id,
+                              n_cases=3, top_anc=3, test_seq_data=None,
+                              protein_id_key='id'):
+    """零样本案例分析：展示"原型从祖先借力 → 命中零样本类"的完整证据链。
+
+    筛选标准: 在零样本类上 Proto 的 top-1 命中，且 MLP 在零样本类内部把该类
+    排名靠后的案例（排序对照，校准无关——Proto 的零样本绝对分数被退化
+    frequency-prior bias 压低，不能与 MLP 直接比绝对值）。
+    按 MLP 排名靠后程度降序取前 n_cases 个。每个案例输出:
+      1. 零样本类 GO ID + 名称（需 go2id 含 'name' 字段，如 TALE 的 *_go_1.pickle）;
+      2. 原型祖先构成: top 贡献祖先的 GO ID / 权重 / hop / 该祖先训练样本量;
+      3. 命中蛋白的身份与证据: 蛋白 ID（若 test_seq_data 记录含 ID 字段）、
+         序列长度、该蛋白的全部测试标注、以及该零样本类的全部测试正样本清单。
+
+    Args:
+        model:          门控融合模型（model_type=1）
+        test_loader:    测试集 DataLoader
+        device:         torch device
+        prototypes:     预计算原型 (C, D)
+        class_counts:   Tensor (C,)，每个类的正样本数
+        hop_counts:     Tensor (C, C)，祖先跳数矩阵
+        go2id:          dict[GO_ID -> {'ind': int, 'father': [...], 'name'?: str}]
+        n_cases:        输出案例数
+        top_anc:        每案例展示的祖先数
+        test_seq_data:  可选，测试集记录列表（与 test_loader 顺序一致），每条含
+                        'seq'，可含 ID 字段（键名由 protein_id_key 指定，常见如
+                        'id'/'protein_id'/'target'；缺失时回退为行索引）
+        protein_id_key: 蛋白 ID 的字段名
+    Returns:
+        list[dict]: 案例记录（含类/祖先/命中蛋白的全部量化细节）
+    """
+    import torch.nn.functional as TF
+
+    print("Starting zero-shot case study...")
+    mlp_probs, proto_probs, all_labels = _collect_gate_probs(model, test_loader, device, prototypes)
+    counts_np = class_counts.cpu().numpy().astype(np.float64)
+    hop_np = hop_counts.cpu().numpy()
+    idx2go = {v['ind']: k for k, v in go2id.items() if isinstance(v, dict) and 'ind' in v}
+
+    # 蛋白身份解析器: 行索引 -> (ID, 序列长度, 标注列表)
+    def protein_identity(p_idx):
+        if test_seq_data is None or p_idx >= len(test_seq_data):
+            return f'row#{p_idx}', None, []
+        item = test_seq_data[p_idx]
+        pid = str(item.get(protein_id_key, f'row#{p_idx}'))
+        seq = item.get('seq', '')
+        # 标注: 优先整数 label 列表，回退 GO 字符串列表
+        annots = item.get('label', item.get('GO', []))
+        return pid, (len(seq) if seq else None), list(annots)
+
+    proto_w = model.proto_model._compute_proto_w().detach().cpu().numpy().astype(np.float64)
+
+    zs_cols = np.where(counts_np == 0)[0]
+    if len(zs_cols) == 0:
+        print("  不存在零样本类别，跳过")
+        return []
+
+    # ---- 蛋白中心筛选（与 eval_zero_shot_topk 口径一致）:
+    # 找 "Proto 把类 c 排该蛋白第一 且 c 为该蛋白真实标签" 的命中对，
+    # 再看 MLP 在零样本类内部把 c 排到第几（rank 越大 = MLP 越盲）。
+    # 注意不能用绝对分数差（Proto 零样本分数被退化 bias 压到 ~1e-5），
+    # 也不能用类中心口径（要求每类的全局 argmax 蛋白是正样本，过严）。
+    candidates = []   # (mlp_rank, cls, prot_idx, n_test_pos, proto_margin)
+    zs_idx = np.arange(len(zs_cols))
+    proto_top1_pos = np.argmax(proto_probs[:, zs_cols], axis=1)     # 每蛋白的 Proto 零样本 top-1 类
+    hit_prots = np.where(all_labels[np.arange(len(all_labels)),
+                                    zs_cols[proto_top1_pos]] > 0.5)[0]
+    for p in hit_prots:
+        c = int(zs_cols[proto_top1_pos[p]])
+        # Proto top-1 的置信 margin（第一名与第二名分差）
+        p_sorted = np.sort(proto_probs[p, zs_cols])[::-1]
+        proto_margin = float(p_sorted[0] - p_sorted[1]) if len(p_sorted) > 1 else float(p_sorted[0])
+        # MLP 在零样本类内把该类排第几（1 = 第一）
+        m_rank = int((mlp_probs[p, zs_cols] > mlp_probs[p, c]).sum()) + 1
+        n_test_pos = int(all_labels[:, c].sum())
+        candidates.append((m_rank, c, int(p), n_test_pos, proto_margin))
+
+    # 排序: MLP 排名越靠后越好（盲区越彻底），其次 proto margin、测试正样本数
+    candidates.sort(key=lambda x: (x[0], x[4], x[3]), reverse=True)
+
+    # 按零样本类去重: 同一类的多个命中蛋白只保留 MLP 排名最靠后的一个，
+    # 避免同一功能的多条蛋白占据全部案例位。
+    seen_cls = set()
+    deduped = []
+    for cand in candidates:
+        if cand[1] in seen_cls:
+            continue
+        seen_cls.add(cand[1])
+        deduped.append(cand)
+    candidates = deduped
+    cases = candidates[:n_cases]
+
+    print("=" * 82)
+    print(f"[零样本案例研究] 候选 {len(candidates)} 个，展示 {len(cases)} 个")
+    print("=" * 82)
+
+    records = []
+    for rank, (m_rank, c, prot, n_test_pos, proto_margin) in enumerate(cases, 1):
+        go_id = idx2go.get(int(c), f'idx{c}')
+        info = go2id.get(go_id, {})
+        go_name = info.get('name', '(name 不可用)')
+
+        # 祖先构成
+        anc_idx = np.where(hop_np[c] > 0)[0]
+        w = proto_w[c, anc_idx]
+        w = w / w.sum()
+        order = np.argsort(-w)
+        eff_anc = float(1.0 / (w ** 2).sum())       # 有效祖先数（权重集中度）
+        anc_desc = []
+        for j in order[:top_anc]:
+            a = int(anc_idx[j])
+            anc_desc.append({
+                'go': idx2go.get(a, str(a)),
+                'name': go2id.get(idx2go.get(a, ''), {}).get('name', ''),
+                'weight': float(w[j]),
+                'hop': int(hop_np[c, a]),
+                'train_pos': int(counts_np[a]),
+            })
+
+        # 命中蛋白身份 + 同类全部测试正样本清单
+        prot_id, prot_len, prot_annots = protein_identity(prot)
+        all_pos_idx = np.where(all_labels[:, c] > 0.5)[0]
+        all_pos_ids = [protein_identity(int(i))[0] for i in all_pos_idx]
+
+        rec = {
+            'rank': rank,
+            'go': go_id, 'name': go_name,
+            'test_pos': n_test_pos,
+            'protein_idx': prot,
+            'protein_id': prot_id,
+            'protein_seq_len': prot_len,
+            'protein_annotations': prot_annots,
+            'all_test_positive_ids': all_pos_ids,
+            'proto_score': float(proto_probs[prot, c]),
+            'mlp_score': float(mlp_probs[prot, c]),
+            'mlp_rank': m_rank,
+            'proto_margin': proto_margin,
+            'eff_ancestors': eff_anc,
+            'ancestors': anc_desc,
+        }
+        records.append(rec)
+
+        print(f"\n案例 {rank}: {go_id} ({go_name})")
+        print(f"  训练正样本=0, 测试正样本={n_test_pos}")
+        print(f"  全部测试正样本: {all_pos_ids}")
+        print(f"  命中蛋白: {prot_id} (行索引={prot}, 序列长={prot_len})")
+        print(f"    该蛋白全部测试标注: {prot_annots}")
+        print(f"  Proto top-1 命中 (score={rec['proto_score']:.4f}, "
+              f"次名 margin={proto_margin:.4f}); "
+              f"MLP 在零样本类内将该类排第 {m_rank} (score={rec['mlp_score']:.4f}) "
+              f"→ MLP 盲区 / Proto 经祖先借力命中")
+        print(f"  原型祖先构成 (top-{top_anc}, 有效祖先数={eff_anc:.1f}):")
+        for a in anc_desc:
+            nm = f" ({a['name']})" if a['name'] else ""
+            print(f"    {a['go']}{nm}: weight={a['weight']:.3f}, hop={a['hop']}, "
+                  f"train_pos={a['train_pos']}")
+    print("=" * 82)
+
+    return records
+
+
+# ============================================================
+#  可解释性实验：层级违反率 + 零样本案例研究
+# ============================================================
+
+def eval_hier_violation_rate(model, test_loader, device, prototypes,
+                             class_counts, hop_counts, model_type=None, eps=1e-4):
+    """层级违反率：统计预测中违反 GO 层级约束（true-path 规则）的边占比。
+
+    对每条层级边 (父 u, 子 v) 和每个测试蛋白 i，若 P_i(v) > P_i(u) + eps，
+    则计为一次违反（子节点得分高于父节点 = 预测了特化功能却否认其泛化功能）。
+
+    在两个层次上统计:
+      - direct: 直接父子边（label_regular_1.npy 的边集）
+      - closure: 祖先闭包所有边（hop_counts > 0 的所有对），
+        即严格的 true-path violation，与 CAFA 评估的层级约束口径一致。
+
+    预期结论:
+      - MLP 的 sigmoid 输出独立预测，违反率较高；
+      - Proto 经祖先平滑（原型=祖先加权平均），分数天然贴合 DAG，违反率显著更低；
+      - 硬门控融合 ≈ MLP（已见类）∪ Proto（零样本类），介于两者之间或接近 MLP。
+
+    Args:
+        model:        待评估模型（支持 model_type 0/1/2）
+        test_loader:  测试集 DataLoader，返回 (batch_feats, labels, indices)
+        device:       torch device
+        prototypes:   预计算原型（model_type 1/2 必需；model_type 0 传 None）
+        class_counts: Tensor (num_classes,)，每个类在训练集中的正样本数
+        hop_counts:   Tensor (C, C)，祖先跳数矩阵（hop_counts[i][j]>0 表示 j 是 i 的祖先）
+        model_type:   0=MLP, 1=门控融合, 2=原型网络；None 视为 1
+        eps:          违反判定的容差（避免浮点噪声把近似相等判为违反）
+    Returns:
+        dict: {'direct': {...}, 'closure': {...}}，各含每模型的违反率
+    """
+    print("Starting hierarchy violation rate evaluation...")
+
+    # 1. 按模型类型收集概率矩阵
+    if model_type == 0:
+        mlp_probs, _ = _collect_mlp_probs(model, test_loader, device)
+        proto_probs = final_probs = None
+        model_desc = "纯MLP(model_type=0)"
+    elif model_type == 2:
+        proto_probs, _ = _collect_proto_probs(model, test_loader, device, prototypes)
+        mlp_probs = final_probs = None
+        model_desc = "纯原型网络(model_type=2)"
+    else:
+        mlp_probs, proto_probs, _ = _collect_gate_probs(model, test_loader, device, prototypes)
+        sigma = model.sigma.detach().cpu().numpy().astype(np.float64)
+        final_probs = sigma[None, :] * mlp_probs + (1.0 - sigma[None, :]) * proto_probs
+        model_desc = f"门控融合(model_type=1), tau_g={model.tau_g:g}"
+
+    hop_np = hop_counts.cpu().numpy()
+    counts_np = class_counts.cpu().numpy().astype(np.float64)
+
+    # 2. 两个层次的边集。方向约定: hop[i][j]>0 表示 j 是 i 的祖先，
+    #    故 nonzero 返回的 (i, j) 中 i 为子、j 为父；统一转为 (parent, child) = (j, i)。
+    edges_direct = [(int(j), int(i)) for i, j in zip(*np.nonzero(hop_np == 1))]
+    closure_mask = hop_np > 0                                    # 祖先闭包
+
+    # 分桶边界（按父节点样本量，观察小样本区域的违反率差异）
+    bins = [('all', None, None), ('rare(≤10)', 0, 10),
+            ('mid(10-50]', 10, 50), ('freq(>50)', 50, np.inf)]
+
+    def violation_rate(probs, parent_idx, child_idx):
+        """单条边在所有蛋白上的违反占比: P(child) > P(parent) + eps 的蛋白比例。"""
+        return float(np.mean(probs[:, child_idx] > probs[:, parent_idx] + eps))
+
+    def report_level(level_name, edge_list, use_closure):
+        print("=" * 78)
+        print(f"[层级违反率] {level_name} (eps={eps:g}), {model_desc}")
+        print("=" * 78)
+        header = f"{'模型':<12}"
+        for name, _, _ in bins:
+            header += f" | {name:>12}"
+        print(header)
+        print("-" * 78)
+
+        results = {}
+        model_set = []
+        if mlp_probs is not None:
+            model_set.append(('MLP', mlp_probs))
+        if proto_probs is not None:
+            model_set.append(('Proto', proto_probs))
+        if final_probs is not None:
+            model_set.append(('融合', final_probs))
+
+        for name, probs in model_set:
+            if use_closure:
+                # 闭包对同样翻转方向: argwhere 返回 (child, parent)，转为 (parent, child)
+                pairs = [(int(j), int(i)) for i, j in np.argwhere(closure_mask)]
+            else:
+                pairs = edge_list
+
+            # 逐桶统计（按父节点的训练样本量过滤边）
+            row = {}
+            for bin_name, lo, hi in bins:
+                if lo is None:
+                    sel = pairs
+                else:
+                    sel = [(u, v) for (u, v) in pairs if lo < counts_np[u] <= hi]
+                if len(sel) == 0:
+                    row[bin_name] = float('nan')
+                    continue
+                vals = [violation_rate(probs, u, v) for (u, v) in sel]
+                row[bin_name] = float(np.mean(vals))
+            results[name] = row
+
+            line = f"{name:<12}"
+            for bin_name, _, _ in bins:
+                line += f" | {row[bin_name]:>12.4f}"
+            print(line)
+        print("=" * 78)
+        return results
+
+    out = {
+        'direct': report_level('直接父子边', edges_direct, use_closure=False),
+        'closure': report_level('祖先闭包(true-path)', None, use_closure=True),
+    }
+    return out
+
+
 def get_prototype_index(data, num_classes):
     prototype_index = torch.zeros(len(data), num_classes)
     for i, item in enumerate(data):
@@ -1549,6 +2479,7 @@ def get_prototype_index(data, num_classes):
         prototype_index[i, labels] = 1.0
 
     return prototype_index
+
 
 def get_hard_neg_indices(pos_indices, go2id):
     """
@@ -1933,8 +2864,6 @@ def test_gradient_ratio(model, query, labels, support, support_indices, parent_i
 
     return bce_grad_norm, hier_grad_norm, ratio
 
-import numpy as np
-
 def get_go_adjacency_matrices(go_dict):
     """
     根据输入的 GO 关系字典，构建直接父节点邻接矩阵和直接子节点邻接矩阵。
@@ -2119,9 +3048,10 @@ def compute_ancestor_weights_ic(hop_counts: torch.Tensor, ic: torch.Tensor,
 
     权重公式: exp(-β * max(ΔIC, 0)) * n / (n + λ)
 
-    - ΔIC = IC(ancestor) - IC(node)：祖先与当前节点的信息量差。
-      ΔIC <= 0 表示祖先更具体（罕见），权重为 1（不衰减）；
-      ΔIC > 0 表示祖先更泛化（常见），IC 差越大权重越低。
+    - ΔIC = IC(node) - IC(ancestor)：当前节点与祖先的信息量差。
+      祖先沿 DAG 向上频率不减，故 IC(ancestor) <= IC(node)，ΔIC >= 0；
+      ΔIC 越大表示祖先越泛化（常见），权重越低；
+      ΔIC <= 0（异常/退化情形）时权重为 1（不衰减）。
       相比跳数，IC 直接反映生物学特异性，泛化程度高的祖先权重低。
     - n = class_counts[j]：祖先节点 j 的正样本数，样本量越大越可靠。
     - λ：控制样本量对权重的影响程度。
@@ -2142,9 +3072,9 @@ def compute_ancestor_weights_ic(hop_counts: torch.Tensor, ic: torch.Tensor,
     """
     ancestor_mask = hop_counts > 0  # (num_nodes, num_nodes)
 
-    # ΔIC[i, j] = IC(j) - IC(i)，广播: ic[j] 按列, ic[i] 按行
+    # ΔIC[i, j] = IC(i) - IC(j)：ic.unsqueeze(1) 沿行广播 ic[i]，ic.unsqueeze(0) 沿列广播 ic[j]
     ic_diff = ic.unsqueeze(1) - ic.unsqueeze(0)  # (num_nodes, num_nodes)
-    # 仅惩罚更泛化的祖先 (ΔIC > 0)，更具体的祖先不衰减
+    # 祖先更泛化时 ΔIC > 0，权重指数衰减；ΔIC <= 0 时不衰减
     ic_factor = torch.exp(-beta_ * ic_diff.clamp(min=0.0))
 
     # n / (n + λ)，样本量缩放因子（按列广播，对应祖先 j）
@@ -2155,3 +3085,517 @@ def compute_ancestor_weights_ic(hop_counts: torch.Tensor, ic: torch.Tensor,
     weight = weight * ancestor_mask.float()  # 非祖先位置置 0
 
     return weight
+
+
+def compute_smooth_param_inits(hop_counts: torch.Tensor, ic: torch.Tensor,
+                               class_counts: torch.Tensor):
+    """基于数据分布自动估计可学习参数 lambda / beta / smooth_tau 的初始值。
+
+    三个参数本质上都是"半饱和常数"，取数据分布的中位数作为初始值，
+    可保证因子在"典型样本"上处于 0.5 附近的敏感区，避免初始即饱和：
+
+    - lambda_init = median(class_counts)：使 n/(n+λ) 在典型类别上为 0.5
+    - tau_init    = median(class_counts)：使 n/(n+τ) 在典型类别上为 0.5
+    - beta_init   = 1 / median(ΔIC>0)：使 exp(-β·ΔIC) 在典型 IC 差上为 0.5
+
+    Args:
+        hop_counts:  形状 (num_nodes, num_nodes)，>0 表示祖先关系及其跳数
+        ic:          形状 (num_nodes,)，每个 GO term 的信息量
+        class_counts: 形状 (num_nodes,)，每个 GO term 的正样本数
+
+    Returns:
+        (lambda_init, beta_init, tau_init): 三个 float 初始值
+    """
+    counts = class_counts.float()
+    positive_counts = counts[counts > 0]
+    if positive_counts.numel() > 0:
+        median_count = float(positive_counts.median().item())
+    else:
+        median_count = 1.0
+
+    lambda_init = max(median_count, 1e-3)
+    tau_init = max(median_count, 1e-3)
+
+    # 祖先对上的 ΔIC = IC(node) - IC(ancestor)，与 compute_ancestor_weights_ic 保持一致
+    ancestor_mask = hop_counts > 0
+    ic_diff = (ic.unsqueeze(1) - ic.unsqueeze(0))[ancestor_mask]
+    ic_diff = ic_diff[ic_diff > 0]
+    if ic_diff.numel() > 0:
+        beta_init = 1.0 / float(ic_diff.median().item())
+    else:
+        beta_init = 1.0
+
+    return lambda_init, beta_init, tau_init
+
+
+# ============================================================
+#  祖先闭包子图采样（BP 大规模场景）
+# ============================================================
+
+def sample_ancestor_closed_subgraph(hop_counts, class_counts, n_target=800, seed=42,
+                                    max_nodes=2500):
+    """按频率分层采样目标节点，并取其祖先闭包，构成祖先闭合子图。
+
+    算法:
+    1. 按 class_counts 将节点分为 rare/low/mid/high 四箱；
+    2. 每箱等量随机采 n_target 个"目标节点"（不足则全取）；
+    3. 对每个目标节点，将其所有祖先（hop_counts[i]>0 的列）一并纳入；
+    4. 返回排序后的节点索引集 S 及 target_mask。
+
+    祖先闭合性保证: 对 S 中任意两节点 i,j，其公共祖先（MICA）也在 S 中，
+    因此 DAG 距离、Resnik/Lin 语义相似度在子图上与全图限制到 S 严格一致。
+
+    规模控制 (max_nodes): Mantel 置换的内存开销 ∝ |S|^2。在内存受限的机器上，
+    工作集一旦超出物理内存会触发 swap，速度骤降数个量级。故当闭包规模超过
+    max_nodes 时，按比例缩小 n_target 并重采（保持四箱等量），直到 |S| 达标。
+    经验值: |S|≈2500 → 节点对≈310万，单次置换工作集≈250MB，可留在物理内存。
+
+    Args:
+        hop_counts:   Tensor (C, C)，祖先跳数矩阵
+        class_counts: Tensor (C,)，每个 GO term 的正样本数
+        n_target:     每个频率箱的目标采样数（期望值，可能被 max_nodes 缩小）
+        seed:         随机种子
+        max_nodes:    子图节点数上限（控制 Mantel 内存开销）
+    Returns:
+        S:           np.ndarray (int64)，子图节点索引（已排序）
+        target_mask: np.ndarray (bool)，长度 |S|，True 表示该节点是被采样的目标
+    """
+    counts = class_counts.cpu().numpy().astype(np.float64)
+    hop_np = hop_counts.cpu().numpy()
+
+    bin_edges = [
+        ('rare', 0, 10), ('low', 10, 50), ('mid', 50, 200), ('high', 200, np.inf),
+    ]
+    # 预计算各箱的节点索引，避免重复扫描
+    bin_indices = []
+    for name, lo, hi in bin_edges:
+        if lo == 0:
+            mask = (counts >= lo) & (counts <= hi)
+        else:
+            mask = (counts > lo) & (counts <= hi)
+        bin_indices.append(np.where(mask)[0])
+
+    cur_target = n_target
+    for attempt in range(6):
+        rng = np.random.default_rng(seed)
+        targets = []
+        for indices in bin_indices:
+            if len(indices) == 0:
+                continue
+            n_sample = min(cur_target, len(indices))
+            targets.append(rng.choice(indices, size=n_sample, replace=False))
+        targets = np.concatenate(targets)
+        target_set = set(targets.tolist())
+
+        # 祖先闭包：对每个目标节点，加入其所有祖先
+        closure = set(targets.tolist())
+        for i in targets:
+            closure.update(np.where(hop_np[i] > 0)[0].tolist())
+
+        if len(closure) <= max_nodes or cur_target <= 1:
+            break
+        # 超出上限：按比例缩小 n_target 重采（保持四箱等量）
+        scale = max_nodes / len(closure)
+        new_target = max(1, int(cur_target * scale))
+        print(f"  [子图采样] 闭包 |S|={len(closure)} 超出上限 {max_nodes}，"
+              f"n_target {cur_target} → {new_target} 重采")
+        cur_target = new_target
+
+    S = np.array(sorted(closure), dtype=np.int64)
+    target_mask = np.array([s in target_set for s in S], dtype=bool)
+
+    print(f"  [子图采样] n_target={cur_target}, 目标节点 {len(targets)}, "
+          f"祖先闭包后 |S|={len(S)}, 其中目标 {target_mask.sum()}, "
+          f"纯祖先 {(~target_mask).sum()}")
+    return S, target_mask
+
+
+# ============================================================
+#  原型嵌入层级一致性分析（实验 1 / 2 / 4）
+# ============================================================
+
+def _pairwise_cos_sim(prototypes):
+    """计算原型两两余弦相似度矩阵（对角线置 0）。
+
+    Args:
+        prototypes: Tensor (C, D)
+    Returns:
+        (C, C) float64 numpy 数组，对角线为 0
+    """
+    p = F.normalize(prototypes.float(), p=2, dim=1)
+    sim = (p @ p.T).clamp(-1.0, 1.0).cpu().numpy().astype(np.float64)
+    np.fill_diagonal(sim, 0.0)
+    return sim
+
+
+def _ancestor_closure(hop_counts):
+    """祖先闭包矩阵：anc_np[i, m] = True 表示 m 是 i 的祖先（含自身，hop = 0）。"""
+    anc = (hop_counts > 0).long()
+    anc.fill_diagonal_(1)  # 每个节点视为自身的祖先（hop = 0）
+    return anc.cpu().numpy().astype(bool)
+
+
+def _dag_distance_matrix(hop_counts, anc_np=None):
+    """计算任意两节点间的 DAG 距离（经由公共祖先的最短路径）。
+
+    d(i, j) = min_{c ∈ Anc(i) ∩ Anc(j)} hop(i, c) + hop(j, c)
+    每个节点视为自身的祖先（hop = 0），因此父子距离为 1、兄弟距离为 2。
+
+    Args:
+        hop_counts: Tensor (C, C)，hop_counts[i][j] > 0 表示 j 是 i 的祖先及跳数
+        anc_np:     可选，预计算的祖先闭包矩阵 (C, C) bool；为 None 时内部计算
+    Returns:
+        (C, C) float64 numpy 数组，对角线为 0
+    """
+    if anc_np is None:
+        anc_np = _ancestor_closure(hop_counts)
+    hop_np = hop_counts.cpu().numpy()
+    C = anc_np.shape[0]
+
+    dist = np.zeros((C, C), dtype=np.float64)
+    for i in range(C):
+        anc_i = np.where(anc_np[i])[0]  # i 的所有祖先（含自身）
+        row = np.full(C, np.inf, dtype=np.float64)
+        for c in anc_i:
+            cand = anc_np[:, c]         # 以 c 为祖先的所有节点 j
+            d = hop_np[i, c] + hop_np[cand, c]
+            row[cand] = np.minimum(row[cand], d)
+        dist[i] = row
+    np.fill_diagonal(dist, 0.0)
+    return dist
+
+
+def _spearman(a, b):
+    """Spearman 秩相关系数。
+
+    使用 scipy.stats.rankdata（C 实现，比 pandas rank 快数倍；
+    两者默认 tie 策略均为 average，排名结果完全一致）。
+    """
+    from scipy.stats import rankdata
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    ra = rankdata(a)
+    rb = rankdata(b)
+    if ra.std() == 0 or rb.std() == 0:
+        return 0.0
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def _replace_inf_with_max(mat):
+    """将矩阵中的 inf 替换为 (最大有限值 + 1)，视不可达对为"最远距离"，
+    保证置换检验中节点对集合在各次置换间保持一致。"""
+    mat = np.asarray(mat, dtype=np.float64).copy()
+    finite = mat[np.isfinite(mat)]
+    if finite.size > 0 and np.isinf(mat).any():
+        mat[np.isinf(mat)] = finite.max() + 1.0
+    return mat
+
+
+def _mantel_test(mat_a, mat_b, permutations=999, seed=42, max_pairs=None):
+    """Mantel 检验：两个距离矩阵上三角向量的 Spearman 相关 + 行/列置换 p 值。
+
+    不可达对（inf）被替换为最大有限距离 + 1，保证置换前后节点对集合一致。
+
+    性能优化（默认路径与原实现数学上完全等价）:
+    1. 置换时用 a[perm[iu0], perm[iu1]] 直接索引取样，不构造 C×C 置换中间矩阵
+       （原实现 a[np.ix_(perm, perm)][iu] 每次置换分配约 200MB 矩阵，是拖慢机器的元凶）；
+    2. vb（第二个矩阵的上三角向量）在置换间不变，其秩只计算一次；
+    3. 排名用 scipy rankdata（C 实现），与 pandas rank 默认 tie 策略一致，结果相同。
+
+    Args:
+        mat_a, mat_b: 形状相同的方阵（允许含 inf）
+        permutations: 置换次数
+        seed:         随机种子
+        max_pairs:    可选，节点对子采样上限。为 None（默认）时使用全部节点对，
+                      与原实现完全等价；设为正整数时对节点对随机子采样以加速
+                      （会改变参与计算的节点对集合，结果不再与原实现逐位一致）。
+    Returns:
+        (observed_corr, p_value)
+    """
+    from scipy.stats import rankdata
+
+    a = _replace_inf_with_max(mat_a)
+    b = _replace_inf_with_max(mat_b)
+    n = a.shape[0]
+    total_pairs = n * (n - 1) // 2
+
+    rng = np.random.default_rng(seed)
+    full_triu = (max_pairs is None or total_pairs <= max_pairs)
+    if not full_triu:
+        # 逆三角映射：从 [0, total_pairs) 均匀采样直接得到上三角坐标 (i, j)，
+        # 不物化全部索引对（注意：此分支无法使用秩聚合，需逐次重新排名）
+        t = rng.integers(0, total_pairs, size=max_pairs)
+        iu0 = n - 2 - np.floor(np.sqrt(-8.0 * t + 4.0 * n * (n - 1) - 7) / 2.0 - 0.5).astype(np.int64)
+        iu1 = t + iu0 + 1 - iu0 * (2 * n - iu0 - 1) // 2
+        print(f"  [Mantel] 节点对总数 {total_pairs:,} > {max_pairs:,}，随机子采样 {max_pairs:,} 对")
+    else:
+        iu0, iu1 = np.triu_indices(n, k=1)
+
+    va = a[iu0, iu1]
+    vb = b[iu0, iu1]
+    if len(va) < 3:
+        return float('nan'), float('nan')
+
+    obs = _spearman(va, vb)
+
+    # 秩只计算一次（va、vb 在置换间多重集不变）
+    ra = rankdata(va)
+    rb = rankdata(vb)
+
+    if full_triu:
+        # ---- 秩聚合（rank-gathering）快速路径 ----
+        # 节点置换 π 只是重排上三角节点对，不改变值的多重集，故
+        # rankdata(va_p)[k] == ra[pos(π(i_k), π(j_k))]，无需重新排序。
+        # 且 Spearman 中 ra 的均值/平方和在置换下不变，可预先计算。
+        ra_mean = ra.mean()
+        ra_ss = np.sqrt(((ra - ra_mean) ** 2).sum())
+        rb_c = rb - rb.mean()
+        rb_ss = np.sqrt((rb_c ** 2).sum())
+
+        count = 0
+        for it in range(permutations):
+            perm = rng.permutation(n)
+            x = perm[iu0]
+            y = perm[iu1]
+            lo = np.minimum(x, y)
+            hi = np.maximum(x, y)
+            # 上三角对 (lo, hi) 在行主序中的位置
+            pi = lo * (n - 1) - lo * (lo - 1) // 2 + (hi - lo - 1)
+            ra_p = ra[pi]                                  # 聚合秩，O(m) 无排序
+            r_p = float(((ra_p - ra_mean) * rb_c).sum() / (ra_ss * rb_ss))
+            if abs(r_p) >= abs(obs):
+                count += 1
+            if (it + 1) % 100 == 0:
+                print(f"  [Mantel] 置换进度 {it + 1}/{permutations}")
+    else:
+        # ---- 子采样回退路径：逐次重新排名 ----
+        rb_c = rb - rb.mean()
+        rb_ss = np.sqrt((rb_c ** 2).sum())
+        count = 0
+        for it in range(permutations):
+            perm = rng.permutation(n)
+            va_p = a[perm[iu0], perm[iu1]]
+            ra_p = rankdata(va_p)
+            ra_p_c = ra_p - ra_p.mean()
+            r_p = float((ra_p_c * rb_c).sum() / (np.sqrt((ra_p_c ** 2).sum()) * rb_ss))
+            if abs(r_p) >= abs(obs):
+                count += 1
+            if (it + 1) % 100 == 0:
+                print(f"  [Mantel] 置换进度 {it + 1}/{permutations}")
+
+    p = (count + 1) / (permutations + 1)
+    return obs, p
+
+
+def _semantic_similarity_matrices(ic, hop_counts, mode='lin', anc_np=None):
+    """计算 GO 语义相似度金标准矩阵（Resnik 或 Lin）。
+
+    以信息量最大的公共祖先 (MICA) 为基础:
+        Resnik(i, j) = max_{c ∈ Anc(i) ∩ Anc(j)} IC(c)
+        Lin(i, j)    = 2 * Resnik(i, j) / (IC(i) + IC(j))
+    每个节点视为自身的祖先，故 Resnik(i, i) = IC(i)，Lin(i, i) = 1。
+
+    Args:
+        ic:         Tensor (C,)，每个 GO term 的信息量
+        hop_counts: Tensor (C, C)，祖先跳数矩阵
+        mode:       'resnik' 或 'lin'
+        anc_np:     可选，预计算的祖先闭包矩阵 (C, C) bool；为 None 时内部计算
+    Returns:
+        (C, C) float64 numpy 数组，对角线为 0，无公共祖先对为 0
+    """
+    if anc_np is None:
+        anc_np = _ancestor_closure(hop_counts)
+
+    C = anc_np.shape[0]
+    ic_np = ic.cpu().numpy().astype(np.float64)
+
+    resnik = np.zeros((C, C), dtype=np.float64)
+    for i in range(C):
+        anc_i = np.where(anc_np[i])[0]  # i 的所有祖先（含自身）
+        row = np.zeros(C, dtype=np.float64)
+        for c in anc_i:
+            cand = anc_np[:, c]         # 以 c 为公共祖先的所有节点 j
+            row[cand] = np.maximum(row[cand], ic_np[c])
+        resnik[i] = row
+
+    if mode == 'resnik':
+        sim = resnik
+    else:  # lin
+        denom = ic_np[:, None] + ic_np[None, :]
+        sim = np.where(denom > 0, 2.0 * resnik / np.maximum(denom, 1e-12), 0.0)
+    np.fill_diagonal(sim, 0.0)
+    return sim
+
+
+def _bin_by_counts(counts, edges):
+    """按样本量构造分箱标签（用于按样本量分层报告指标）。"""
+    counts = np.asarray(counts, dtype=np.float64)
+    labels = np.full(counts.shape, 'all', dtype=object)
+    for name, lo, hi in edges:
+        labels[(counts > lo) & (counts <= hi)] = name
+    return labels
+
+
+def eval_prototype_mantel(prototypes_stable, prototypes_mean, hop_counts, permutations=999):
+    """实验 1 (Mantel 检验): 原型余弦距离矩阵 vs DAG 距离矩阵的一致性。
+
+    对平滑前（均值原型）与平滑后（稳定原型）分别计算两个距离矩阵上三角向量
+    的 Spearman 相关，并通过行/列置换得到 p 值。
+    相关系数越高，说明原型嵌入的全局几何越贴合 GO 层级拓扑。
+
+    Args:
+        prototypes_stable: Tensor (C, D)，稳定原型（经 _smooth_prototypes）
+        prototypes_mean:   Tensor (C, D)，纯均值原型（未平滑）
+        hop_counts:        Tensor (C, C)，祖先跳数矩阵
+        permutations:      Mantel 检验置换次数
+    Returns:
+        dict: {tag: {'corr': float, 'p_value': float}}
+    """
+    print("=" * 70)
+    print("[实验1 Mantel] 原型余弦距离 vs DAG 距离")
+    print("=" * 70)
+
+    anc_np = _ancestor_closure(hop_counts)
+    dag_dist = _dag_distance_matrix(hop_counts, anc_np=anc_np)
+
+    results = {}
+    for tag, protos in [('mean (平滑前)', prototypes_mean), ('stable (平滑后)', prototypes_stable)]:
+        cos_dist = 1.0 - _pairwise_cos_sim(protos)
+        obs, p = _mantel_test(cos_dist, dag_dist, permutations=permutations)
+        results[tag] = {'corr': obs, 'p_value': p}
+        print(f"  {tag}: Spearman r = {obs:.4f}, p = {p:.4f}")
+
+    return results
+
+
+def eval_prototype_semantic_similarity(prototypes_stable, prototypes_mean, hop_counts,
+                                       ic, class_counts, target_mask=None):
+    """实验 2 (语义相似度相关): 原型余弦相似度 vs Resnik / Lin 语义相似度。
+
+    对平滑前（均值原型）与平滑后（稳定原型）分别计算原型余弦相似度矩阵与
+    Resnik / Lin 语义相似度金标准矩阵的 Spearman 相关（整体 + 按样本量分箱）。
+    相关系数越高，说明原型嵌入与 GO 语义结构越对齐。
+
+    Args:
+        prototypes_stable: Tensor (C, D)，稳定原型（经 _smooth_prototypes）
+        prototypes_mean:   Tensor (C, D)，纯均值原型（未平滑）
+        hop_counts:        Tensor (C, C)，祖先跳数矩阵
+        ic:                Tensor (C,)，每个 GO term 的信息量
+        class_counts:      Tensor (C,)，每个 GO term 的正样本数
+        target_mask:       可选 bool 数组 (C,)。提供时（子图场景）分箱仅统计
+                           被采样的目标节点，闭包祖先不参与分箱；整体相关仍用全部节点对。
+    Returns:
+        dict: 各相关系数
+    """
+    print("=" * 70)
+    print("[实验2 语义相似度] 原型余弦相似度 vs Resnik / Lin")
+    print("=" * 70)
+
+    anc_np = _ancestor_closure(hop_counts)
+    dag_dist = _dag_distance_matrix(hop_counts, anc_np=anc_np)
+    sem_resnik = _semantic_similarity_matrices(ic, hop_counts, mode='resnik', anc_np=anc_np)
+    sem_lin = _semantic_similarity_matrices(ic, hop_counts, mode='lin', anc_np=anc_np)
+
+    counts_np = class_counts.cpu().numpy().astype(np.float64)
+    bin_edges = [
+        ('rare', 0, 10), ('low', 10, 50), ('mid', 50, 200), ('high', 200, np.inf),
+    ]
+    bin_labels = _bin_by_counts(counts_np, bin_edges)
+    if target_mask is not None:
+        target_mask = np.asarray(target_mask.cpu() if torch.is_tensor(target_mask) else target_mask, dtype=bool)
+
+    results = {}
+    for tag, protos in [('mean (平滑前)', prototypes_mean), ('stable (平滑后)', prototypes_stable)]:
+        cos_sim = _pairwise_cos_sim(protos)
+        iu = np.triu_indices(cos_sim.shape[0], k=1)
+        valid = np.isfinite(dag_dist[iu])
+
+        # 整体相关（全部节点对）
+        for mode, sem in [('resnik', sem_resnik), ('lin', sem_lin)]:
+            r = _spearman(cos_sim[iu][valid], sem[iu][valid])
+            results[f'{mode}_{tag}'] = r
+            print(f"  {tag}: cos_sim vs {mode.capitalize()} Spearman r = {r:.4f}")
+
+        # 按样本量分箱（以 Lin 为例）；提供 target_mask 时仅统计目标节点
+        print(f"  {tag} 分箱:")
+        for name, _, _ in bin_edges:
+            row_mask = bin_labels == name
+            if target_mask is not None:
+                row_mask = row_mask & target_mask
+            pair_mask = row_mask[iu[0]] | row_mask[iu[1]]
+            valid_bin = pair_mask & valid
+            if valid_bin.sum() < 10:
+                continue
+            r_bin = _spearman(cos_sim[iu][valid_bin], sem_lin[iu][valid_bin])
+            results[f'lin_{tag}_bin_{name}'] = r_bin
+            print(f"    {name:>5} (n_pairs={valid_bin.sum():>7}): Lin Spearman r = {r_bin:.4f}")
+
+    return results
+
+
+def eval_prototype_knn_purity(prototypes_stable, prototypes_mean, hop_counts,
+                              class_counts, k=5, h=2, target_mask=None):
+    """实验 4 (kNN 谱系纯度): 每个原型最近 k 个邻居中 DAG 距离 <= h 的占比。
+
+    该指标是 t-SNE 局部聚集现象的定量对应：纯度越高，说明每个原型周围的
+    邻居越集中于其 GO 谱系（父/兄弟/叔伯范围）。整体 + 按样本量分箱报告。
+
+    使用 argpartition（O(C)）替代 argsort（O(C log C)）选取 top-k 邻居。
+
+    Args:
+        prototypes_stable: Tensor (C, D)，稳定原型（经 _smooth_prototypes）
+        prototypes_mean:   Tensor (C, D)，纯均值原型（未平滑）
+        hop_counts:        Tensor (C, C)，祖先跳数矩阵
+        class_counts:      Tensor (C,)，每个 GO term 的正样本数
+        k:                 邻居数
+        h:                 DAG 距离阈值
+        target_mask:       可选 bool 数组 (C,)。提供时（子图场景）整体与分箱
+                           纯度仅统计被采样的目标节点，闭包祖先不参与。
+    Returns:
+        dict: 各纯度指标
+    """
+    print("=" * 70)
+    print(f"[实验4 kNN谱系纯度] k={k}, h={h}")
+    print("=" * 70)
+
+    anc_np = _ancestor_closure(hop_counts)
+    dag_dist = _dag_distance_matrix(hop_counts, anc_np=anc_np)
+
+    counts_np = class_counts.cpu().numpy().astype(np.float64)
+    bin_edges = [
+        ('rare', 0, 10), ('low', 10, 50), ('mid', 50, 200), ('high', 200, np.inf),
+    ]
+    bin_labels = _bin_by_counts(counts_np, bin_edges)
+    if target_mask is not None:
+        target_mask = np.asarray(target_mask.cpu() if torch.is_tensor(target_mask) else target_mask, dtype=bool)
+
+    results = {}
+    for tag, protos in [('mean (平滑前)', prototypes_mean), ('stable (平滑后)', prototypes_stable)]:
+        cos_sim = _pairwise_cos_sim(protos)
+        C = cos_sim.shape[0]
+
+        # argpartition 逐行选 top-k（排除自身）
+        nn_idx = np.empty((C, k), dtype=np.int64)
+        for i in range(C):
+            part = np.argpartition(-cos_sim[i], k + 1)[:k + 1]
+            part = part[part != i]
+            nn_idx[i] = part[:k]
+
+        within = dag_dist[np.arange(C)[:, None], nn_idx] <= h
+        purity = within.mean(axis=1)                            # (C,)
+
+        # 提供 target_mask 时仅统计目标节点
+        report_mask = target_mask if target_mask is not None else np.ones(C, dtype=bool)
+
+        overall = float(purity[report_mask].mean())
+        results[tag] = {'overall': overall}
+        print(f"  {tag}: overall purity = {overall:.4f}")
+        for name, _, _ in bin_edges:
+            m = (bin_labels == name) & report_mask
+            if m.sum() == 0:
+                continue
+            val = float(purity[m].mean())
+            results[f'{tag}_bin_{name}'] = val
+            print(f"    {name:>5} (n={m.sum():>5}): purity = {val:.4f}")
+
+    return results
