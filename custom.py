@@ -94,6 +94,50 @@ def train(model, optimizer, loader, epoch, device, scale, hier_reg_lambda, paren
         
     print("Averaged stats: {}".format(metric_logger.global_avg()))
 
+def build_ancestor_prior(datasets_path, namespace, dataset_name, edges,
+                         train_seq_data, class_counts, valid_mask, is_zero_shot):
+    """构建祖先加权分类头所需的层级先验，复用 prototype.py 中的 hop_counts / ic 计算过程。
+
+    Returns:
+        (ancestor_mask, ic, lambda_init, gamma_init):
+        - ancestor_mask: (C, C) BoolTensor，mask[i][j]=True 表示 j 是 i 的祖先
+        - ic: (C,) 各 GO term 的信息量
+        - lambda_init / gamma_init: α 权重中样本量敏感度 λ 与 IC 衰减速率 γ 的数据驱动初始值
+    """
+    hop_counts = utils.get_ancestor_hop_matrix(edges)  # 每个节点到任意祖先节点的跳数
+    if not is_zero_shot: hop_counts = hop_counts[valid_mask][:, valid_mask]
+    ancestor_mask = hop_counts > 0
+    if dataset_name == 'TALE':
+        # TALE 数据集：通过 go2id pickle 与 goatools 计算 IC
+        # （祖先掩码直接由 hop_counts 二值化得到，无需再构建 parents_matrix）
+        go2id = utils.load_data_from_pkl(os.path.join(datasets_path, f"{namespace.lower()}_go_1.pickle"))
+        obo_path = os.path.join(datasets_path, 'go-basic.obo')
+        ic = utils.compute_ic(go2id, train_seq_data, obo_path)
+        if not is_zero_shot: ic = ic[valid_mask]
+    else:
+        # CAFA3 数据集：缺少可靠的 *_go_1.pickle，直接从 label_regular_1.npy 和 train_seq_data 计算
+        # train_seq_data 的 label 字段已沿 DAG 传播祖先标注，故直接统计每个类别索引的蛋白质数，
+        # 除以根节点（最大计数）得到频率，IC = -log(freq)。与 goatools TermCounts 结果一致（已在 TALE 上验证）。
+        from collections import Counter
+        import math
+        num_nodes = int(edges.max()) + 1
+        label_counts = Counter()
+        for item in train_seq_data:
+            for idx in item.get('label', []):
+                label_counts[idx] += 1
+        total_count = max(label_counts.values()) if label_counts else 1  # 根节点计数
+        ic = np.zeros(num_nodes, dtype=np.float64)
+        for idx in range(num_nodes):
+            cnt = label_counts.get(idx, 0)
+            freq = cnt / total_count if total_count > 0 else 0.0
+            ic[idx] = -math.log(freq) if freq > 0 else 0.0
+        ic = torch.from_numpy(ic).float()
+        if not is_zero_shot: ic = ic[valid_mask]
+    # α 的可学习超参初始值由数据分布自动估计（与 prototype.py 一致，无需手工设置）
+    lambda_init, gamma_init, _ = utils.compute_smooth_param_inits(hop_counts, ic, class_counts)
+    print(f'祖先加权分类头可学习参数初始值(数据驱动): lambda={lambda_init:.4f}, gamma={gamma_init:.4f}')
+    return ancestor_mask, ic, lambda_init, gamma_init
+
 def main(args, config):
     device = torch.device(args.device)
     seed = args.seed
@@ -107,6 +151,9 @@ def main(args, config):
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     is_zero_shot = config['zero_shot']
+    # 分类头配置: True 为"自由残差 + 祖先加权构造"（默认），False 为原始经典 MLP 分类头（消融基准）
+    use_ancestor_weighting = config.get('use_ancestor_weighting', True)
+    beta_init = float(config.get('beta_init', 0.5))
     print('数据集:', dataset_name, 'namespace: ', namespace)
     num_classes =  np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
     features_path = os.path.join('/archive/hot5/fty/', dataset_name)
@@ -132,17 +179,28 @@ def main(args, config):
     else:
         train_loader, valid_loader = get_loader(datasets_path, namespace, batch_size, protein_feats, test_protein_feats, num_classes, mode, None, g)
 
-    model = Model(
-        input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes
-    ).to(device)
-
-    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)  
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
-
     _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
     parent_indices = torch.from_numpy(_edges[:, 0].copy()).long().to(device)
     child_indices = torch.from_numpy(_edges[:, 1].copy()).long().to(device)
+
+    # ---- 祖先加权分类头：复用 prototype.py 的 hop_counts / ic 计算过程构建层级先验 ----
+    ancestor_mask, ic, alpha_lambda_init, ic_gamma_init = None, None, 10.0, 2.0
+    if use_ancestor_weighting:
+        ancestor_mask, ic, alpha_lambda_init, ic_gamma_init = build_ancestor_prior(
+            datasets_path, namespace, dataset_name, _edges, train_seq_data,
+            class_counts, valid_mask, is_zero_shot)
     del _edges  # 立即释放 numpy 内存
+
+    model = Model(
+        input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes,
+        use_ancestor_weighting=use_ancestor_weighting,
+        ancestor_mask=ancestor_mask, ic=ic, class_counts=class_counts,
+        alpha_lambda_init=alpha_lambda_init, ic_gamma_init=ic_gamma_init,
+        beta_init=beta_init
+    ).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
     # utils.print_loss_gradients(model, train_loader, parent_indices, child_indices, device)
     # hier_scale = utils.get_hier_scale(model, train_loader, parent_indices, child_indices, device) # 静态标定法缩放梯度
@@ -180,12 +238,18 @@ def main(args, config):
 
         # 验证
         all_probs, all_labels = valid(model, valid_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices)
+
+        # 打印祖先加权分类头可学习参数的当前实际值，观察学习进度
+        if use_ancestor_weighting:
+            lam, gam, bet = model.get_ancestor_params()
+            print("ancestor head params: lambda: {:.4f}, gamma: {:.4f}, beta: {:.4f}".format(lam, gam, bet))
+
     
     # utils.draw_frequencies_AUPRC(torch.cat(all_probs, dim=0).numpy(), torch.cat(all_probs_averge, dim=0).numpy(), torch.cat(all_labels, dim=0).numpy(), valid_freq, save_path=result_path, namespace=namespace) # 训练结束绘制结果曲线图
         # 仅保存模型权重（每个 epoch 一个文件），节省磁盘；不再保存 optimizer/scheduler/config
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.save(model.state_dict(), os.path.join(ckpt_dir, 'checkpoint_%02d.pth' % epoch))
-        utils.eval_func_generalizability(model, valid_loader, device, go_freq, None, model_type=0)
+        # utils.eval_func_generalizability(model, valid_loader, device, go_freq, None, model_type=0)
 
         # ---- 每个 epoch 结束后的额外评估 ----
         # 零样本 top-k 注释评估（TALE 协议）：零样本类内部 top-k，扫描 k=1..10

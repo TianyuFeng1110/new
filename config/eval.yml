@@ -5,8 +5,8 @@ model_type: 1                # 0: custom, 1: custom + prototype (gate fusion), 2
 features_path: /archive/hot5/fty/
 checkpoint_path: /archive/hot5/fty/checkpoints/
 
-checkpoint_custom: checkpoint_46.pth # CC：【TALE 45 CAFA3 34】MF：【TALE 48 CAFA3 40】BP：【TALE 46 CAFA3 42】
-checkpoint_proto: checkpoint_55.pth # CC：【TALE 122 CAFA3 139】MF：【TALE 146 CAFA3 144】BP：【TALE 143 CAFA3 127】
+checkpoint_custom: checkpoint_32.pth # CC：【TALE 45 CAFA3 34】MF：【TALE 48 CAFA3 40】BP：【TALE 46 CAFA3 42】
+checkpoint_proto: checkpoint_89.pth # CC：【TALE 122 CAFA3 139】MF：【TALE 146 CAFA3 144】BP：【TALE 143 CAFA3 127】
 
 dataset: TALE
 datasets_path: './data_tale/'
@@ -19,7 +19,7 @@ beta: 2                       # △IC 衰减速率
 # 门控超参（model_type=1 时使用）：sigma = n/(n+tau_g)，n 为训练正样本数
 tau_g: 0.0                    # 半饱和常数：n=tau_g 时 sigma=0.5，越小越接近硬门控，可根据参数化模块自定义调整
 
-namespace: BP
+namespace: MF
 queue_size: 50
 
 zero_shot: True
